@@ -203,261 +203,192 @@ static void wifi_init_sta(void)
 
 #define EXAMPLE_LVGL_TASK_PRIORITY     2
 
-// Stream state for simplified SOI/Data/EOI protocol
-typedef enum {
-    STREAM_STATE_WAITING_SOI,
-    STREAM_STATE_RECEIVING_DATA, 
-    STREAM_STATE_COMPLETE
-} stream_state_t;
+// ─────────────────────────────────────────────────────────────────────────────
+// UDP Streaming Tasks
+//
+// Protocol (matches iOS UDPStreamSender.swift):
+//   ESP32 ──UDP 5001──► iOS   "HELLO\0" every UDP_HELLO_INTERVAL ms
+//   ESP32 ◄──UDP 5000── iOS   JPEG frames split into packets:
+//     SOI  packet : 0xFF 0xD8  (exactly 2 bytes)
+//     DATA packets: raw JPEG   (≤1400 bytes each)
+//     EOI  packet : 0xFF 0xD9  (exactly 2 bytes)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Stream context for frame assembly
-typedef struct {
-    stream_state_t state;
-    uint8_t *frame_buffer;
-    size_t frame_size;
-    size_t frame_capacity;
-    uint32_t start_time;
-} stream_context_t;
-
-static stream_context_t stream_ctx = {
-    .state = STREAM_STATE_WAITING_SOI,
-    .frame_buffer = NULL,
-    .frame_size = 0,
-    .frame_capacity = 0,
-    .start_time = 0
-};
-
-// Initialize stream buffer with fixed capacity for JPEG frames (<15KB)
-static bool init_stream_buffer(void)
+// ── UDP HELLO task ────────────────────────────────────────────────────────────
+// Sends "HELLO" to iOS/Python sender on UDP_DISCOVER_PORT so it learns our IP.
+static void udp_hello_task(void *pvParameters)
 {
-    if (stream_ctx.frame_buffer) {
-        return true; // Already allocated
-    }
-    
-    // Allocate fixed 16KB buffer (larger than max JPEG size for safety)
-    const size_t fixed_capacity = 32 * 1024; 
-    stream_ctx.frame_buffer = (uint8_t*)heap_caps_malloc(fixed_capacity, MALLOC_CAP_SIMD);
-    if (!stream_ctx.frame_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate stream buffer (%zu bytes)", fixed_capacity);
-        return false;
-    }
-    
-    stream_ctx.frame_capacity = fixed_capacity;
-    stream_ctx.frame_size = 0;
-    ESP_LOGD(TAG, "Allocated fixed %zu byte stream buffer", fixed_capacity);
-    return true;
-}
+    ESP_LOGI(TAG, "UDP hello task: sending HELLO to %s:%d every %d ms",
+             STREAM_SERVER_IP, UDP_DISCOVER_PORT, UDP_HELLO_INTERVAL);
 
-// Check if data fits in fixed buffer
-static bool check_buffer_capacity(size_t needed_size)
-{
-    if (needed_size <= stream_ctx.frame_capacity) {
-        return true;
-    }
-    
-    ESP_LOGE(TAG, "Data size %zu exceeds buffer capacity %zu", needed_size, stream_ctx.frame_capacity);
-    return false;
-}
+    struct sockaddr_in dest = {};
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(UDP_DISCOVER_PORT);
+    inet_pton(AF_INET, STREAM_SERVER_IP, &dest.sin_addr);
 
-// UDP receiver task
-static void udp_receiver_task(void *pvParameters)
-{
-    int sock = -1;
-    struct sockaddr_in server_addr;
-    int consecutive_errors = 0;
-    const int MAX_CONSECUTIVE_ERRORS = 10;
-    int opt = 1;
-    struct timeval timeout;
-    int err;
-    struct sockaddr_in source_addr;
-    socklen_t socklen;
-    int len;
-    
-    // Initialize stream buffer for direct packet reception
-    if (!init_stream_buffer()) {
-        ESP_LOGE(TAG, "Failed to initialize stream buffer");
-        goto cleanup;
-    }
-    
-    // Create UDP socket
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-        goto cleanup;
-    }
-    
-    // Set socket options for better performance
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    // Set receive timeout to prevent indefinite blocking
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    
-    // Configure server address
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(UDP_PORT);
-    
-    // Bind socket
-    err = bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (err < 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
-        goto cleanup;
-    }
-    
-    ESP_LOGI(TAG, "Socket bound, listening on port %d", UDP_PORT);
-    ESP_LOGI(TAG, "Expecting SOI/Data/EOI packet sequence");
-    
     while (1) {
-        socklen = sizeof(source_addr);
-        
-        // Calculate available space in buffer
-        size_t available_space = stream_ctx.frame_capacity - stream_ctx.frame_size;
-        if (available_space < MAX_UDP_PACKET) {
-            available_space = MAX_UDP_PACKET; // Allow at least one packet
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "HELLO: socket() failed errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
         }
-        
-        // Receive directly into frame buffer at current position
-        len = recvfrom(sock, stream_ctx.frame_buffer + stream_ctx.frame_size, 
-                      available_space, 0, (struct sockaddr *)&source_addr, &socklen);
-        
-        if (len < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Timeout - check for frame timeout
-                if (stream_ctx.state == STREAM_STATE_RECEIVING_DATA) {
-                    uint32_t current_time = esp_timer_get_time() / 1000;
-                    if (current_time - stream_ctx.start_time > 5000) {
-                        ESP_LOGW(TAG, "Frame receive timeout, resetting stream");
-                        if (stream_ctx.frame_buffer) {
-                            // Don't free buffer, just reset state
-                            stream_ctx.state = STREAM_STATE_WAITING_SOI;
-                            stream_ctx.frame_size = 0;
-                        }
-                    }
-                }
-                continue;
-            }
-            
-            ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
-            consecutive_errors++;
-            
-            if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
-                ESP_LOGE(TAG, "Too many consecutive UDP errors, restarting task");
+
+        const char *hello = "HELLO";
+        while (1) {
+            int n = sendto(sock, hello, strlen(hello) + 1, 0,
+                           (struct sockaddr *)&dest, sizeof(dest));
+            if (n < 0) {
+                ESP_LOGE(TAG, "HELLO: sendto errno %d — recreating socket", errno);
                 break;
             }
-            
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
+            ESP_LOGD(TAG, "HELLO sent to %s:%d", STREAM_SERVER_IP, UDP_DISCOVER_PORT);
+            vTaskDelay(pdMS_TO_TICKS(UDP_HELLO_INTERVAL));
         }
-        
-        if (len == 0) {
-            ESP_LOGW(TAG, "Received empty UDP packet");
-            continue;
-        }
-        
-        consecutive_errors = 0;
-        
-        // Process packet based on SOI/Data/EOI protocol
-        if (len < 2) {
-            ESP_LOGW(TAG, "Packet too small (%d bytes), ignoring", len);
-            continue;
-        }
-        
-        // Check for SOI marker (0xFF 0xD8) in received data
-        uint8_t *packet_data = stream_ctx.frame_buffer + stream_ctx.frame_size;
-        if (len == 2 && packet_data[0] == 0xFF && packet_data[1] == 0xD8) {
-            ESP_LOGD(TAG, "Received SOI packet - removing from buffer");
-            
-            // SOI received directly in buffer, but we don't want it in final JPEG
-            // Just set state and don't increment frame_size
-            stream_ctx.state = STREAM_STATE_RECEIVING_DATA;
-            stream_ctx.start_time = esp_timer_get_time() / 1000;
-            continue;
-        }
-        
-        // Check for EOI marker (0xFF 0xD9) in received data
-        if (len == 2 && packet_data[0] == 0xFF && packet_data[1] == 0xD9) {
-            ESP_LOGD(TAG, "Received EOI packet - processing complete frame");
-            
-            if (stream_ctx.state != STREAM_STATE_RECEIVING_DATA) {
-                ESP_LOGW(TAG, "Received EOI but not in receiving state, ignoring");
-                continue;
-            }
-            
-            // EOI received directly in buffer, but we don't want it in final JPEG
-            // Don't increment frame_size, process the frame as-is
-            
-            // Process complete frame - put buffer directly into queue
-            jpeg_frame_t frame;
-            frame.data = stream_ctx.frame_buffer;
-            frame.size = stream_ctx.frame_size;
-            
-            ESP_LOGD(TAG, "Complete JPEG frame received: %zu bytes", frame.size);
-            
-            // Send frame to queue for processing
-            if (xQueueSend(jpeg_frame_queue, &frame, 0) == pdTRUE) {
-                // Frame queued successfully, allocate new buffer for next frame
-                // The display task will free the frame data
-                stream_ctx.frame_buffer = NULL;
-                stream_ctx.frame_capacity = 0;
-                stream_ctx.frame_size = 0;
-                
-                // Allocate new buffer for next frame
-                if (!init_stream_buffer()) {
-                    ESP_LOGE(TAG, "Failed to allocate new buffer for next frame");
-                    stream_ctx.state = STREAM_STATE_WAITING_SOI;
-                    continue;
-                }
-            } else {
-                ESP_LOGW(TAG, "JPEG frame queue full, dropping frame");
-                // Keep using the same buffer for next frame
-                stream_ctx.frame_size = 0;
-            }
-            
-            // Reset for next frame
-            stream_ctx.state = STREAM_STATE_WAITING_SOI;
-            continue;
-        }
-        
-        // Handle data packets
-        if (stream_ctx.state == STREAM_STATE_RECEIVING_DATA) {
-            // Check for frame timeout
-            uint32_t current_time = esp_timer_get_time() / 1000;
-            if (current_time - stream_ctx.start_time > 5000) {
-                ESP_LOGW(TAG, "Frame timeout, resetting stream");
-                stream_ctx.state = STREAM_STATE_WAITING_SOI;
-                stream_ctx.frame_size = 0;
-                continue;
-            }
-            
-            // Check if data fits in fixed buffer (already received at correct position)
-            if (!check_buffer_capacity(stream_ctx.frame_size + len)) {
-                ESP_LOGE(TAG, "Data packet would overflow fixed buffer, resetting");
-                stream_ctx.state = STREAM_STATE_WAITING_SOI;
-                stream_ctx.frame_size = 0;
-                continue;
-            }
-            
-            // Data already received directly into buffer, just update frame size
-            stream_ctx.frame_size += len;
-            
-            ESP_LOGD(TAG, "Added %d bytes to frame (total: %zu bytes)", len, stream_ctx.frame_size);
-        } else {
-            ESP_LOGD(TAG, "Received data packet but not in receiving state, ignoring");
-        }
-    }
-    
-cleanup:
-    if (stream_ctx.frame_buffer) {
-        free(stream_ctx.frame_buffer);
-        stream_ctx.frame_buffer = NULL;
-    }
-    if (sock >= 0) {
+
         close(sock);
     }
-    
-    ESP_LOGI(TAG, "UDP receiver task ending");
+
+    vTaskDelete(NULL);
+}
+
+// ── UDP receiver task ─────────────────────────────────────────────────────────
+// Receives JPEG frame packets on UDP_STREAM_PORT and feeds assembled frames
+// to the display task via jpeg_frame_queue.
+
+typedef enum {
+    UDP_STATE_WAITING_SOI = 0,
+    UDP_STATE_RECEIVING_DATA,
+} udp_rx_state_t;
+
+static void udp_receiver_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "UDP receiver task: listening on port %d", UDP_STREAM_PORT);
+
+    static uint8_t pkt_buf[UDP_MAX_PACKET];
+    uint8_t  *frame_buf  = NULL;
+    size_t    frame_used = 0;
+    udp_rx_state_t state = UDP_STATE_WAITING_SOI;
+    TickType_t last_data_tick = 0;
+    const TickType_t FRAME_TIMEOUT_TICKS = pdMS_TO_TICKS(3000);
+
+    // Pre-allocate frame assembly buffer once (reused across frames)
+    frame_buf = (uint8_t *)heap_caps_malloc(MAX_JPEG_FRAME_SIZE, MALLOC_CAP_SIMD);
+    if (!frame_buf) {
+        ESP_LOGE(TAG, "UDP rx: failed to allocate frame buffer (%d B)", MAX_JPEG_FRAME_SIZE);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (1) {
+        // ── Create and bind UDP socket ────────────────────────────────────────
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "UDP rx: socket() errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // 1-second receive timeout so we can detect frame assembly timeouts
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in local = {};
+        local.sin_family      = AF_INET;
+        local.sin_addr.s_addr = INADDR_ANY;
+        local.sin_port        = htons(UDP_STREAM_PORT);
+
+        if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            ESP_LOGE(TAG, "UDP rx: bind(::%d) errno %d", UDP_STREAM_PORT, errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "UDP receiver bound on port %d", UDP_STREAM_PORT);
+        state      = UDP_STATE_WAITING_SOI;
+        frame_used = 0;
+
+        // ── Receive loop ──────────────────────────────────────────────────────
+        while (1) {
+            int n = recvfrom(sock, pkt_buf, sizeof(pkt_buf), 0, NULL, NULL);
+
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Receive timeout — check for stuck frame assembly
+                    if (state == UDP_STATE_RECEIVING_DATA &&
+                        (xTaskGetTickCount() - last_data_tick) > FRAME_TIMEOUT_TICKS) {
+                        ESP_LOGW(TAG, "UDP rx: frame assembly timeout — resetting");
+                        state      = UDP_STATE_WAITING_SOI;
+                        frame_used = 0;
+                    }
+                    continue;
+                }
+                ESP_LOGE(TAG, "UDP rx: recvfrom errno %d — rebinding", errno);
+                break;
+            }
+
+            if (n == 0) continue;
+
+            switch (state) {
+            case UDP_STATE_WAITING_SOI:
+                // SOI framing packet: exactly 2 bytes 0xFF 0xD8.
+                // This is a delimiter only — the JPEG DATA packets that follow
+                // already contain the full JPEG including its own 0xFF 0xD8 header.
+                if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD8) {
+                    frame_used     = 0;   // reset assembly buffer
+                    state          = UDP_STATE_RECEIVING_DATA;
+                    last_data_tick = xTaskGetTickCount();
+                    ESP_LOGD(TAG, "UDP rx: SOI — assembling frame");
+                }
+                break;
+
+            case UDP_STATE_RECEIVING_DATA:
+                last_data_tick = xTaskGetTickCount();
+
+                if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD9) {
+                    // EOI framing packet: the DATA bytes already form a complete JPEG.
+                    // Do NOT append 0xFF 0xD9 — it would duplicate the JPEG's own EOI.
+                    // Copy to a new heap buffer owned by the display task
+                    uint8_t *queued = (uint8_t *)heap_caps_malloc(frame_used, MALLOC_CAP_SIMD);
+                    if (queued) {
+                        memcpy(queued, frame_buf, frame_used);
+                        jpeg_frame_t frm = { .data = queued, .size = frame_used };
+                        if (xQueueSend(jpeg_frame_queue, &frm, 0) == pdTRUE) {
+                            ESP_LOGI(TAG, "UDP rx: queued frame %u B", (unsigned)frame_used);
+                        } else {
+                            ESP_LOGD(TAG, "UDP rx: display queue full — dropping frame");
+                            free(queued);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "UDP rx: alloc %u B failed", (unsigned)frame_used);
+                    }
+                    state      = UDP_STATE_WAITING_SOI;
+                    frame_used = 0;
+
+                } else {
+                    // DATA packet: append to assembly buffer
+                    if (frame_used + (size_t)n > MAX_JPEG_FRAME_SIZE) {
+                        ESP_LOGE(TAG, "UDP rx: frame overflow (%zu B) — discarding", frame_used);
+                        state      = UDP_STATE_WAITING_SOI;
+                        frame_used = 0;
+                    } else {
+                        memcpy(frame_buf + frame_used, pkt_buf, n);
+                        frame_used += (size_t)n;
+                    }
+                }
+                break;
+            }
+        }
+
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+    }
+
+    free(frame_buf);   // never reached, but good practice
     vTaskDelete(NULL);
 }
 
@@ -950,17 +881,19 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting WiFi initialization");
     wifi_init_sta();
 
-    // Start UDP receiver task on Core 0 (network I/O)
-    xTaskCreatePinnedToCore(udp_receiver_task, "udp_receiver", 8192, NULL, 4, NULL, UDP_RECEIVER_CPU);
-    ESP_LOGI(TAG, "UDP receiver task created on CPU %d", UDP_RECEIVER_CPU);
-    
+    // Start UDP tasks on Core 0 (network I/O)
+    xTaskCreatePinnedToCore(udp_hello_task,    "udp_hello", 4096, NULL, 3, NULL, UDP_RECEIVER_CPU);
+    xTaskCreatePinnedToCore(udp_receiver_task, "udp_rx",    8192, NULL, 4, NULL, UDP_RECEIVER_CPU);
+    ESP_LOGI(TAG, "UDP hello+receiver tasks created on CPU %d", UDP_RECEIVER_CPU);
+
     // Start JPEG display task on Core 1 (decode/display)
     xTaskCreatePinnedToCore(jpeg_display_task, "jpeg_display", 8192, NULL, 5, NULL, JPEG_DECODER_CPU);
     ESP_LOGI(TAG, "JPEG display task created on CPU %d", JPEG_DECODER_CPU);
 
-    ESP_LOGI(TAG, "JPEG Stream Receiver initialized successfully - Dual-Core Direct LCD Mode");
-    ESP_LOGI(TAG, "Listening for JPEG streams on port %d", UDP_PORT);
-    ESP_LOGI(TAG, "Make sure to update WIFI_SSID and WIFI_PASS in the code!");
+    ESP_LOGI(TAG, "JPEG Stream Receiver initialized — UDP mode");
+    ESP_LOGI(TAG, "Sending HELLO to %s:%d every %d ms",
+             STREAM_SERVER_IP, UDP_DISCOVER_PORT, UDP_HELLO_INTERVAL);
+    ESP_LOGI(TAG, "Listening for JPEG frames on UDP port %d", UDP_STREAM_PORT);
 
     // test_jpeg_decoder();
 
