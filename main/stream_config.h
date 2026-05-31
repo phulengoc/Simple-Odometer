@@ -25,12 +25,13 @@
 // Interval between HELLO packets (ms)
 #define UDP_HELLO_INTERVAL   1000
 
-// Display configuration — matches iOS NavigationFrameCapture outputSide
-#define STREAM_WIDTH        466
-#define STREAM_HEIGHT       466
+// Streamed frame size — must match iOS NavigationFrameCapture.outputSide.
+// Smaller than the 466×466 panel; the receiver centers it (panel can't upscale).
+#define STREAM_WIDTH        400
+#define STREAM_HEIGHT       400
 
 // Maximum JPEG frame size in bytes
-// iOS map at 466×466 @ quality 0.65 can reach ~90 KB; 128 KB gives ample headroom.
+// iOS map at 400×400 @ quality 0.65 stays well under this; 128 KB is ample headroom.
 #define MAX_JPEG_FRAME_SIZE (128 * 1024)
 
 // Delay between task restarts on error (ms)

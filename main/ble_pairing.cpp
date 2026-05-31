@@ -182,16 +182,33 @@ static bool parse_wifi_cred_json(const char *json,
 
 #define BLE_TERM_WINDOW_MS  3000   // 3-second window for WiFi cred delivery
 
+// Set true by ble_pairing_deinit(); makes all NimBLE-touching contexts bail out
+// so the host can be freed without a use-after-free.
+static volatile bool s_ble_shutting_down = false;
+// Handle of the pending ble_term_task (NULL when none is running). deinit waits
+// on this so it never frees the host while the term task is calling into it.
+static TaskHandle_t  s_term_task = NULL;
+
 static void ble_term_task(void *arg)
 {
     uint16_t conn_handle = (uint16_t)(uintptr_t)arg;
-    vTaskDelay(pdMS_TO_TICKS(BLE_TERM_WINDOW_MS));
 
-    struct ble_gap_conn_desc desc;
-    if (ble_gap_conn_find(conn_handle, &desc) == 0) {
-        ESP_LOGI(TAG, "BLE term: disconnecting after %d ms pairing window", BLE_TERM_WINDOW_MS);
-        ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+    // Sleep the pairing window in small steps so a shutdown can pre-empt us
+    // promptly — we must NOT call into the NimBLE host once teardown begins.
+    const TickType_t step = pdMS_TO_TICKS(100);
+    for (TickType_t waited = 0; waited < pdMS_TO_TICKS(BLE_TERM_WINDOW_MS); waited += step) {
+        if (s_ble_shutting_down) { s_term_task = NULL; vTaskDelete(NULL); }
+        vTaskDelay(step);
     }
+
+    if (!s_ble_shutting_down) {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+            ESP_LOGI(TAG, "BLE term: disconnecting after %d ms pairing window", BLE_TERM_WINDOW_MS);
+            ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+        }
+    }
+    s_term_task = NULL;   // signal deinit that we are done touching the host
     vTaskDelete(NULL);
 }
 
@@ -252,8 +269,10 @@ static int port_chr_access(uint16_t conn_handle, uint16_t attr_handle,
                  BLE_TERM_WINDOW_MS);
         // 4096-byte stack: this task calls NimBLE host APIs (ble_gap_conn_find /
         // ble_gap_terminate) whose call chain overflows a 2048-byte stack.
-        xTaskCreate(ble_term_task, "ble_term", 4096,
-                    (void *)(uintptr_t)conn_handle, 5, NULL);
+        if (!s_ble_shutting_down) {
+            xTaskCreate(ble_term_task, "ble_term", 4096,
+                        (void *)(uintptr_t)conn_handle, 5, &s_term_task);
+        }
     }
 
     return 0;
@@ -399,6 +418,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
 
 static void ble_app_advertise(void)
 {
+    // Don't (re)start advertising once teardown has begun — the disconnect and
+    // adv-complete events fire during deinit and would touch a freed host.
+    if (s_ble_shutting_down) return;
+
     // ── Main advertisement: flags + device name ──────────────────────────────
     struct ble_hs_adv_fields adv_fields = {};
     adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -511,4 +534,33 @@ void ble_pairing_init(void)
     nimble_port_freertos_init(nimble_host_task);
 
     ESP_LOGI(TAG, "BLE pairing init done — service UUID 12AB3456-0000-1000-8000-00805F9B34FB");
+}
+
+void ble_pairing_deinit(void)
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    // 1. Signal all NimBLE-touching contexts to stand down. This stops the
+    //    disconnect/adv-complete callbacks from re-advertising and tells any
+    //    pending ble_term_task to bail out instead of calling into the host.
+    s_ble_shutting_down = true;
+
+    // 2. Wait (bounded) for a pending ble_term_task to finish using the host,
+    //    so we never free it out from under an in-flight ble_gap_* call.
+    for (int i = 0; i < 25 && s_term_task != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));   // ~500 ms max; term task exits within ~100 ms
+    }
+
+    // 3. Stop advertising, stop the host run loop (returns from nimble_port_run()
+    //    in nimble_host_task, which self-deinits its task), then free host + ctlr.
+    ble_gap_adv_stop();
+    int rc = nimble_port_stop();
+    if (rc == 0) {
+        nimble_port_deinit();
+        ESP_LOGI(TAG, "NimBLE stopped & deinitialised — BT radio released to WiFi");
+    } else {
+        ESP_LOGW(TAG, "nimble_port_stop failed: %d — BLE left running", rc);
+    }
 }

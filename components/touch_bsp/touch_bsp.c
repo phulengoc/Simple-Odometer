@@ -31,6 +31,13 @@ void Touch_Init(void)
   I2C_writr_buff(I2C_ADDR_FT3168,0x00,&data,1); //Switch to normal mode
 
 }
+void Touch_Sleep(void)
+{
+  // FT3168 power-mode register 0xA5: 0x03 = hibernate. Harmless no-op if the
+  // controller ignores it; touch is not used during streaming.
+  uint8_t data = 0x03;
+  I2C_writr_buff(I2C_ADDR_FT3168, 0xA5, &data, 1);
+}
 uint8_t getTouch(uint16_t *x,uint16_t *y)
 {
   uint8_t data = 0;

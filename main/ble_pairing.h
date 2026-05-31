@@ -47,6 +47,12 @@ extern char g_wifi_pass[64];   // max 63 chars + NUL
 /// advertising.  Call once from app_main() after nvs_flash_init().
 void ble_pairing_init(void);
 
+/// Stop advertising and fully tear down the NimBLE host + BT controller.
+/// Call once streaming is established to remove the priority-21 host task and
+/// WiFi/BT radio coexistence. One-way: provisioning is unavailable until reboot.
+/// Safe to call more than once.
+void ble_pairing_deinit(void);
+
 /// Load saved WiFi credentials from NVS flash.
 /// Copies into ssid_out (≥33 bytes) and pass_out (≥64 bytes).
 /// Returns true if valid non-empty credentials were found.

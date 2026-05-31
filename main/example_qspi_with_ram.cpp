@@ -61,18 +61,48 @@ static int  s_retry_num    = 0;
 static bool s_wifi_started = false;   // true after esp_wifi_start()
 static const int MAXIMUM_RETRY = 5;
 
-// JPEG buffer and processing
-static QueueHandle_t jpeg_frame_queue;
+// ── JPEG frame pool (P1 + P2) ─────────────────────────────────────────────────
+// Fixed pool of PSRAM-backed frame buffers, recycled via two index queues
+// instead of malloc/free per frame. The buffer index is the ownership token:
+//   s_free_q  : indices the receiver may fill   (seeded with all N at startup)
+//   s_ready_q : {index,size} assembled and ready for the display task
+// Ownership flows free_q → receiver → ready_q → display → free_q. No allocation,
+// copy, or fragmentation in the hot path; memory use is deterministic.
+//
+// N = 3 gives one slot in flight (1 decoding + 1 queued + 1 filling) so the
+// receiver rarely has to drop frames when display rate ≈ network rate.
+#define FRAME_POOL_COUNT  3
+
+typedef struct {
+    int    idx;     // pool buffer index
+    size_t size;    // valid JPEG bytes in that buffer
+} frame_msg_t;
+
+static uint8_t      *s_frame_pool[FRAME_POOL_COUNT];
+static QueueHandle_t s_free_q;    // queue of int  (free buffer indices)
+static QueueHandle_t s_ready_q;   // queue of frame_msg_t (filled frames)
 
 // Status/wait-screen info lines, filled once WiFi is up; reused by the display
 // task to repaint the wait screen if the stream stalls.
 static char s_status_ssid_line[40] = "";
 static char s_status_ip_line[24]   = "";
 
-typedef struct {
-    uint8_t *data;
-    size_t size;
-} jpeg_frame_t;
+// ── Streaming-mode power/CPU management ────────────────────────────────────────
+// When streaming is confirmed (first decoded frame), we shed Core-0 work that
+// competes with the UDP/decode pipeline: tear down BLE (removes the priority-21
+// NimBLE host task + WiFi/BT coexistence) and suspend the HELLO discovery beacon.
+// HELLO is resumed if the stream stalls so the iOS app can re-discover us.
+static TaskHandle_t s_hello_task_handle = NULL;
+static bool s_ble_down        = false;   // BLE torn down (one-way)
+static bool s_hello_suspended = false;   // HELLO beacon currently suspended
+
+// Centering offset for a streamed image smaller than the 466×466 panel (e.g.
+// 400×400). Set per-frame from the decoded dimensions; 0 when it fills the panel.
+static int  s_draw_off_x = 0;
+static int  s_draw_off_y = 0;
+// Clear the panel border around a centered image once before the next frame —
+// after boot and after every wait-screen repaint (both paint the full panel).
+static bool s_need_border_clear = true;
 
 // Display globals (LVGL disabled for performance)
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
@@ -342,7 +372,11 @@ static void udp_hello_task(void *pvParameters)
             int n = sendto(sock, hello, strlen(hello) + 1, 0,
                            (struct sockaddr *)&dest, sizeof(dest));
             if (n < 0) {
-                ESP_LOGE(TAG, "HELLO: sendto errno %d — recreating socket", errno);
+                // Network may be transiently down (e.g. ENETUNREACH during a
+                // WiFi reconnect). Back off before recreating the socket so we
+                // don't tight-loop and flood the console.
+                ESP_LOGW(TAG, "HELLO: sendto errno %d — retrying", errno);
+                vTaskDelay(pdMS_TO_TICKS(UDP_HELLO_INTERVAL));
                 break;
             }
             ESP_LOGD(TAG, "HELLO → %s:%d", target_ip, UDP_DISCOVER_PORT);
@@ -369,19 +403,21 @@ static void udp_receiver_task(void *pvParameters)
     ESP_LOGI(TAG, "UDP receiver task: listening on port %d", UDP_STREAM_PORT);
 
     static uint8_t pkt_buf[UDP_MAX_PACKET];
-    uint8_t  *frame_buf  = NULL;
+    int       cur_idx    = -1;     // pool buffer currently being filled (-1 = none)
+    uint8_t  *frame_buf  = NULL;   // == s_frame_pool[cur_idx] while filling
     size_t    frame_used = 0;
     udp_rx_state_t state = UDP_STATE_WAITING_SOI;
     TickType_t last_data_tick = 0;
     const TickType_t FRAME_TIMEOUT_TICKS = pdMS_TO_TICKS(500);   // 500 ms — fast recovery on BLE preemption
 
-    // Pre-allocate frame assembly buffer once (reused across frames)
-    frame_buf = (uint8_t *)heap_caps_malloc(MAX_JPEG_FRAME_SIZE, MALLOC_CAP_SIMD);
-    if (!frame_buf) {
-        ESP_LOGE(TAG, "UDP rx: failed to allocate frame buffer (%d B)", MAX_JPEG_FRAME_SIZE);
-        vTaskDelete(NULL);
-        return;
-    }
+    // Frame buffers are pre-allocated once in app_main (PSRAM pool); this task
+    // never allocates. It borrows a buffer from s_free_q per frame, assembles
+    // directly into it, and hands it to the display task via s_ready_q.
+    // RX_RECYCLE() returns any in-flight buffer to the pool — it MUST be called
+    // on every abandon path or the pool slowly drains and the receiver stalls.
+    #define RX_RECYCLE() do { \
+        if (cur_idx >= 0) { xQueueSend(s_free_q, &cur_idx, 0); cur_idx = -1; frame_buf = NULL; } \
+    } while (0)
 
     while (1) {
         // ── Create and bind UDP socket ────────────────────────────────────────
@@ -417,6 +453,7 @@ static void udp_receiver_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "UDP receiver bound on port %d", UDP_STREAM_PORT);
+        RX_RECYCLE();
         state      = UDP_STATE_WAITING_SOI;
         frame_used = 0;
 
@@ -430,12 +467,14 @@ static void udp_receiver_task(void *pvParameters)
                     if (state == UDP_STATE_RECEIVING_DATA &&
                         (xTaskGetTickCount() - last_data_tick) > FRAME_TIMEOUT_TICKS) {
                         ESP_LOGW(TAG, "UDP rx: frame assembly timeout — resetting");
+                        RX_RECYCLE();
                         state      = UDP_STATE_WAITING_SOI;
                         frame_used = 0;
                     }
                     continue;
                 }
                 ESP_LOGE(TAG, "UDP rx: recvfrom errno %d — rebinding", errno);
+                RX_RECYCLE();
                 break;
             }
 
@@ -447,10 +486,19 @@ static void udp_receiver_task(void *pvParameters)
                 // This is a delimiter only — the JPEG DATA packets that follow
                 // already contain the full JPEG including its own 0xFF 0xD8 header.
                 if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD8) {
-                    frame_used     = 0;   // reset assembly buffer
+                    // Borrow a pool buffer to assemble into. If none is free the
+                    // display task is behind — drop this frame (stay WAITING_SOI)
+                    // rather than block the socket and overflow the UDP mailbox.
+                    if (xQueueReceive(s_free_q, &cur_idx, 0) != pdTRUE) {
+                        cur_idx = -1;
+                        ESP_LOGD(TAG, "UDP rx: no free buffer — dropping frame");
+                        break;
+                    }
+                    frame_buf      = s_frame_pool[cur_idx];
+                    frame_used     = 0;
                     state          = UDP_STATE_RECEIVING_DATA;
                     last_data_tick = xTaskGetTickCount();
-                    ESP_LOGD(TAG, "UDP rx: SOI — assembling frame");
+                    ESP_LOGD(TAG, "UDP rx: SOI — assembling frame (buf %d)", cur_idx);
                 }
                 break;
 
@@ -470,29 +518,30 @@ static void udp_receiver_task(void *pvParameters)
                 }
 
                 if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD9) {
-                    // EOI framing packet: the DATA bytes already form a complete JPEG.
-                    // Do NOT append 0xFF 0xD9 — it would duplicate the JPEG's own EOI.
-                    // Copy to a new heap buffer owned by the display task
-                    uint8_t *queued = (uint8_t *)heap_caps_malloc(frame_used, MALLOC_CAP_SIMD);
-                    if (queued) {
-                        memcpy(queued, frame_buf, frame_used);
-                        jpeg_frame_t frm = { .data = queued, .size = frame_used };
-                        if (xQueueSend(jpeg_frame_queue, &frm, 0) == pdTRUE) {
-                            ESP_LOGI(TAG, "UDP rx: queued frame %u B", (unsigned)frame_used);
+                    // EOI framing packet: pool[cur_idx] now holds a complete JPEG
+                    // (the DATA bytes already include the JPEG's own 0xFFD9, so we
+                    // do not append the marker). Hand the buffer to the display
+                    // task by index — zero-copy ownership transfer.
+                    if (frame_used > 0 && cur_idx >= 0) {
+                        frame_msg_t msg = { .idx = cur_idx, .size = frame_used };
+                        if (xQueueSend(s_ready_q, &msg, 0) == pdTRUE) {
+                            cur_idx = -1; frame_buf = NULL;   // ownership → display
+                            ESP_LOGD(TAG, "UDP rx: queued frame %u B", (unsigned)frame_used);
                         } else {
                             ESP_LOGD(TAG, "UDP rx: display queue full — dropping frame");
-                            free(queued);
+                            RX_RECYCLE();   // give the buffer back, drop the frame
                         }
                     } else {
-                        ESP_LOGE(TAG, "UDP rx: alloc %u B failed", (unsigned)frame_used);
+                        RX_RECYCLE();       // empty frame — recycle the buffer
                     }
                     state      = UDP_STATE_WAITING_SOI;
                     frame_used = 0;
 
                 } else {
-                    // DATA packet: append to assembly buffer
+                    // DATA packet: append directly into the pool buffer
                     if (frame_used + (size_t)n > MAX_JPEG_FRAME_SIZE) {
                         ESP_LOGE(TAG, "UDP rx: frame overflow (%zu B) — discarding", frame_used);
+                        RX_RECYCLE();
                         state      = UDP_STATE_WAITING_SOI;
                         frame_used = 0;
                     } else {
@@ -508,8 +557,8 @@ static void udp_receiver_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 
-    free(frame_buf);   // never reached, but good practice
-    vTaskDelete(NULL);
+    #undef RX_RECYCLE
+    vTaskDelete(NULL);   // never reached
 }
 
 
@@ -542,26 +591,27 @@ static int jpeg_decode_callback(JPEGDRAW *pDraw)
         return 0; // Stop decoding
     }
     
+    // Destination on the panel. The streamed image may be smaller than the
+    // 466×466 panel (e.g. 400×400), so center it with the per-frame offset.
+    int dst_x = pDraw->x + s_draw_off_x;
+    int dst_y = pDraw->y + s_draw_off_y;
+
     // Complete bounds check
-    if (pDraw->x >= EXAMPLE_LCD_H_RES || pDraw->y >= EXAMPLE_LCD_V_RES) {
-        ESP_LOGE(TAG, "Draw position out of bounds: x=%d, y=%d", pDraw->x, pDraw->y);
-        return 1; // Skip this draw but continue
+    if (dst_x >= EXAMPLE_LCD_H_RES || dst_y >= EXAMPLE_LCD_V_RES) {
+        return 1; // off-screen — skip this block but continue
     }
-    
+
     // Calculate safe copy dimensions
     int copy_width = pDraw->iWidth;
     int copy_height = pDraw->iHeight;
-    
-    if (pDraw->x + copy_width > EXAMPLE_LCD_H_RES) {
-        copy_width = EXAMPLE_LCD_H_RES - pDraw->x;
-        // ESP_LOGI(TAG, "Copy width > EXAMPLE_LCD_H_RES, adjusted to %d", copy_width);
+
+    if (dst_x + copy_width > EXAMPLE_LCD_H_RES) {
+        copy_width = EXAMPLE_LCD_H_RES - dst_x;
     }
-    
-    if (pDraw->y + copy_height > EXAMPLE_LCD_V_RES) {
-        copy_height = EXAMPLE_LCD_V_RES - pDraw->y;
-        // ESP_LOGI(TAG, "Copy height > EXAMPLE_LCD_V_RES, adjusted to %d", copy_height);
+    if (dst_y + copy_height > EXAMPLE_LCD_V_RES) {
+        copy_height = EXAMPLE_LCD_V_RES - dst_y;
     }
-    
+
     if (copy_width <= 0 || copy_height <= 0) {
         return 1; // Nothing to copy, but continue
     }
@@ -583,9 +633,9 @@ static int jpeg_decode_callback(JPEGDRAW *pDraw)
     // memcpy(draw_buffer, pDraw->pPixels, pixel_count * sizeof(uint16_t));
     
     // Start DMA transfer with our persistent buffer
-    esp_err_t ret = esp_lcd_panel_draw_bitmap(g_panel_handle, 
-                                              pDraw->x, pDraw->y,
-                                              pDraw->x + copy_width, pDraw->y + copy_height,
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(g_panel_handle,
+                                              dst_x, dst_y,
+                                              dst_x + copy_width, dst_y + copy_height,
                                               pDraw->pPixels);
     
     if (ret != ESP_OK) {
@@ -608,69 +658,109 @@ static int jpeg_decode_callback(JPEGDRAW *pDraw)
 // Simplified JPEG display task - decodes directly to LCD (no LVGL)
 static void jpeg_display_task(void *pvParameters)
 {
-    jpeg_frame_t frame;
+    frame_msg_t frame;
     static int frame_count = 0;
-    
+
     // Wait for panel handle to be initialized
     while (g_panel_handle == NULL) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    
+
     ESP_LOGI(TAG, "JPEG display task started - drawing directly to LCD");
 
     bool waiting_shown = false;   // true while the wait screen is displayed
 
     while (1) {
         // Time-bounded wait so we can repaint the wait screen if the stream stalls.
-        if (!xQueueReceive(jpeg_frame_queue, &frame, pdMS_TO_TICKS(3000))) {
+        if (!xQueueReceive(s_ready_q, &frame, pdMS_TO_TICKS(3000))) {
             if (!waiting_shown) {
                 status_screen_show("ESP32 MapNav", "Waiting for stream",
                                    s_status_ssid_line[0] ? s_status_ssid_line : NULL,
                                    s_status_ip_line[0]   ? s_status_ip_line   : NULL);
                 waiting_shown = true;
+                s_need_border_clear = true;   // wait screen painted full panel
+            }
+            // Stream stalled — resume the HELLO beacon so the iOS app can
+            // re-discover us. (BLE stays down; its teardown is one-way.)
+            if (s_hello_task_handle && s_hello_suspended) {
+                vTaskResume(s_hello_task_handle);
+                s_hello_suspended = false;
+                ESP_LOGI(TAG, "Stream stalled — HELLO beacon resumed");
             }
             continue;
         }
 
         {
             // A frame arrived — it will overwrite the wait screen.
+            uint8_t *jpeg = s_frame_pool[frame.idx];
             waiting_shown = false;
-            ESP_LOGD(TAG, "Received JPEG frame: %d bytes", frame.size);
+            ESP_LOGD(TAG, "Received JPEG frame: %u bytes (buf %d)", (unsigned)frame.size, frame.idx);
             frame_count++;
 
             bool decode_success = false;
-            
-            // Measure decode time
-            int64_t decode_start = esp_timer_get_time();
-            
+
+            // Sanity-check framing before decoding — protects JPEGDEC from a
+            // corrupt/merged buffer (must start 0xFFD8 and end 0xFFD9).
+            bool valid = (frame.size >= 4 &&
+                          jpeg[0] == 0xFF && jpeg[1] == 0xD8 &&
+                          jpeg[frame.size - 2] == 0xFF && jpeg[frame.size - 1] == 0xD9);
+
             // Open and decode JPEG with direct LCD callback
-            if (jpeg_dec.openRAM(frame.data, frame.size, jpeg_decode_callback)) {
-                ESP_LOGD(TAG, "JPEG opened: %dx%d, bpp: %d", 
+            if (valid && jpeg_dec.openRAM(jpeg, frame.size, jpeg_decode_callback)) {
+                ESP_LOGD(TAG, "JPEG opened: %dx%d, bpp: %d",
                         jpeg_dec.getWidth(), jpeg_dec.getHeight(), jpeg_dec.getBpp());
-                
+
                 // Set pixel format to RGB565 for direct LCD output
                 jpeg_dec.setPixelType(RGB565_BIG_ENDIAN);
-                
-                // int64_t decode_only_start = esp_timer_get_time();
+
+                // Center the (possibly sub-panel) image; the decode callback adds
+                // this offset to every MCU block.
+                int iw = jpeg_dec.getWidth();
+                int ih = jpeg_dec.getHeight();
+                s_draw_off_x = (EXAMPLE_LCD_H_RES - iw) / 2;
+                s_draw_off_y = (EXAMPLE_LCD_V_RES - ih) / 2;
+                if (s_draw_off_x < 0) s_draw_off_x = 0;
+                if (s_draw_off_y < 0) s_draw_off_y = 0;
+
+                // Black out the panel once so no stale border surrounds a
+                // smaller-than-panel image (after boot / after a wait screen).
+                if (s_need_border_clear && (iw < EXAMPLE_LCD_H_RES || ih < EXAMPLE_LCD_V_RES)) {
+                    status_screen_show(NULL, NULL, NULL, NULL);
+                    s_need_border_clear = false;
+                }
+
                 if (jpeg_dec.decode(0, 0, JPEG_USES_DMA)) {
-                    // int64_t decode_end = esp_timer_get_time();
-                    // float decode_time_ms = (decode_end - decode_only_start) / 1000.0f;
-                    // float total_time_ms = (decode_end - decode_start) / 1000.0f;
-                    // ESP_LOGI(TAG, "Frame %d: decode=%0.2fms, total=%0.2fms, fps=%0.1f", 
-                            // frame_count, decode_time_ms, total_time_ms, 1000.0f / total_time_ms);
                     decode_success = true;
                 }
                 jpeg_dec.close();
             } else {
-                ESP_LOGE(TAG, "Failed to open JPEG frame %d", frame_count);
+                ESP_LOGW(TAG, "Frame %d: %s", frame_count,
+                         valid ? "JPEG open failed" : "bad SOI/EOI framing — skipped");
             }
 
             if (!decode_success) {
-                ESP_LOGE(TAG, "Decode failed for frame %d", frame_count);
+                ESP_LOGD(TAG, "Decode failed for frame %d", frame_count);
             }
-            
-            // Free the frame data
-            free(frame.data);
+
+            // ── Enter streaming mode on the first proven frame ────────────────
+            // The pipeline works (IP discovered, frame decoded), so shed Core-0
+            // load: tear down BLE once, and suspend the HELLO beacon while frames
+            // flow. Both are restored/handled appropriately on stall.
+            if (decode_success) {
+                if (!s_ble_down) {
+                    s_ble_down = true;
+                    ESP_LOGI(TAG, "Streaming active — tearing down BLE");
+                    ble_pairing_deinit();
+                }
+                if (s_hello_task_handle && !s_hello_suspended) {
+                    vTaskSuspend(s_hello_task_handle);
+                    s_hello_suspended = true;
+                    ESP_LOGI(TAG, "Streaming active — HELLO beacon suspended");
+                }
+            }
+
+            // Return the buffer to the pool (replaces free()).
+            xQueueSend(s_free_q, &frame.idx, 0);
         }
     }
 }
@@ -802,20 +892,20 @@ static void example_lvgl_port_task(void *arg)
 
 void test_jpeg_decoder()
 {
-    jpeg_frame_t frame;
+    int idx;
+    if (xQueueReceive(s_free_q, &idx, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Test JPEG: no free pool buffer");
+        return;
+    }
+    memcpy(s_frame_pool[idx], tulips, sizeof(tulips));
 
-    uint8_t* jpeg_data = (uint8_t*) heap_caps_malloc(sizeof(tulips), MALLOC_CAP_SIMD);
-    memcpy(jpeg_data, tulips, sizeof(tulips));
-    frame.data = jpeg_data;
-    frame.size = sizeof(tulips);
-
-    // Send frame to queue for processing
-    if (xQueueSend(jpeg_frame_queue, &frame, 0) == pdTRUE) {
+    frame_msg_t frame = { .idx = idx, .size = sizeof(tulips) };
+    if (xQueueSend(s_ready_q, &frame, 0) == pdTRUE) {
         ESP_LOGI(TAG, "Test JPEG frame queued successfully");
     } else {
         ESP_LOGW(TAG, "Failed to queue test JPEG frame");
+        xQueueSend(s_free_q, &idx, 0);   // recycle on failure
     }
-
 }
 
 void app_main(void)
@@ -833,12 +923,27 @@ void app_main(void)
     // The udp_hello_task will block until BLE_IP_RECEIVED_BIT is set (or 30 s).
     ble_pairing_init();
 
-    // Create JPEG frame queue
-    jpeg_frame_queue = xQueueCreate(2, sizeof(jpeg_frame_t));
-    if (jpeg_frame_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create JPEG frame queue");
+    // ── JPEG frame pool (P1 + P2) ──────────────────────────────────────────────
+    // Pre-allocate FRAME_POOL_COUNT PSRAM frame buffers and seed the free-index
+    // queue. Buffers are recycled for the life of the program — no per-frame
+    // malloc/free, no fragmentation, deterministic memory use.
+    s_free_q  = xQueueCreate(FRAME_POOL_COUNT, sizeof(int));
+    s_ready_q = xQueueCreate(FRAME_POOL_COUNT, sizeof(frame_msg_t));
+    if (!s_free_q || !s_ready_q) {
+        ESP_LOGE(TAG, "Failed to create frame pool queues");
         return;
     }
+    for (int i = 0; i < FRAME_POOL_COUNT; i++) {
+        s_frame_pool[i] = (uint8_t *)heap_caps_malloc(MAX_JPEG_FRAME_SIZE, MALLOC_CAP_SPIRAM);
+        if (!s_frame_pool[i]) {
+            ESP_LOGE(TAG, "Failed to allocate frame pool buffer %d (%d B PSRAM)",
+                     i, MAX_JPEG_FRAME_SIZE);
+            return;
+        }
+        xQueueSend(s_free_q, &i, 0);   // all buffers start free
+    }
+    ESP_LOGI(TAG, "JPEG frame pool: %d × %d KB in PSRAM",
+             FRAME_POOL_COUNT, MAX_JPEG_FRAME_SIZE / 1024);
 
     // Read LCD ID
     READ_LCD_ID = read_lcd_id();
@@ -1070,6 +1175,11 @@ void app_main(void)
         }
         status_screen_show("ESP32 MapNav", "Waiting for stream",
                            s_status_ssid_line, s_status_ip_line);
+
+        // Streaming prerequisites met (WiFi up + provisioned). Touch is unused
+        // during streaming — put the controller to sleep now. (BLE + HELLO are
+        // shed later, on the first decoded frame — see jpeg_display_task.)
+        Touch_Sleep();
     } else {
         status_screen_show("ESP32 MapNav", "Wi-Fi failed",
                            "check credentials", NULL);
@@ -1077,7 +1187,7 @@ void app_main(void)
 
     // Core 0: HELLO sender lives with Wi-Fi / NimBLE (same RF subsystem)
     xTaskCreatePinnedToCore(udp_hello_task,    "udp_hello",    4096, NULL,
-                            UDP_HELLO_PRIORITY,    NULL, UDP_HELLO_CPU);
+                            UDP_HELLO_PRIORITY,    &s_hello_task_handle, UDP_HELLO_CPU);
 
     // Core 1: receiver + decoder — completely isolated from NimBLE on Core 0
     xTaskCreatePinnedToCore(udp_receiver_task, "udp_rx",       8192, NULL,
