@@ -1,188 +1,65 @@
-# Claude Code Configuration - RuFlo V3
+# CLAUDE.md
 
-## Behavioral Rules (Always Enforced)
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-- Do what has been asked; nothing more, nothing less
-- NEVER create files unless they're absolutely necessary for achieving your goal
-- ALWAYS prefer editing an existing file to creating a new one
-- NEVER proactively create documentation files (*.md) or README files unless explicitly requested
-- NEVER save working files, text/mds, or tests to the root folder
-- Never continuously check status after spawning a swarm — wait for results
-- ALWAYS read a file before editing it
-- NEVER commit secrets, credentials, or .env files
+## What This Is
 
-## File Organization
+ESP32-S3 firmware that receives a JPEG video stream over WiFi/UDP from the MapNav iOS app and renders it on a 466×466 QSPI AMOLED panel. The on-device sender counterpart lives in the sibling `MapNavigationSwiftUI` / `maplibre-navigation-ios` projects in the parent workspace; this repo is the **receiver/display** end.
 
-- NEVER save to root folder — use the directories below
-- Use `/src` for source code files
-- Use `/tests` for test files
-- Use `/docs` for documentation and markdown files
-- Use `/config` for configuration files
-- Use `/scripts` for utility scripts
-- Use `/examples` for example code
+Despite directory and target names inherited from the upstream Espressif `qspi_with_ram` LVGL example, this is now a bespoke streaming app. **`README.md` is the stale upstream example doc** (LVGL dashboard demo) — ignore it. `README_STREAM.md` is closer but predates full JPEG decode (it still says "Android" and "metadata only"); the source is the source of truth.
 
-## Project Architecture
+## Build, Flash, Test
 
-- Follow Domain-Driven Design with bounded contexts
-- Keep files under 500 lines
-- Use typed interfaces for all public APIs
-- Prefer TDD London School (mock-first) for new code
-- Use event sourcing for state changes
-- Ensure input validation at system boundaries
-
-### Project Config
-
-- **Topology**: hierarchical-mesh
-- **Max Agents**: 15
-- **Memory**: hybrid
-- **HNSW**: Enabled
-- **Neural**: Enabled
-
-## Build & Test
+This is an **ESP-IDF 5.3.2** project (CMake + `idf.py`), not an npm project. Always source the IDF toolchain first via the `get_idf` shell alias (it sources `$IDF_PATH/export.sh`); without it `idf.py` / `xtensa-esp32s3-elf-gcc` are not on `PATH`.
 
 ```bash
-# Build
-npm run build
-
-# Test
-npm test
-
-# Lint
-npm run lint
+get_idf
+idf.py set-target esp32s3     # only needed on a fresh checkout
+idf.py build
+idf.py -p <PORT> flash monitor   # Ctrl-] to exit monitor
+idf.py menuconfig             # editing sdkconfig; defaults live in sdkconfig.defaults
 ```
 
-- ALWAYS run tests after making code changes
-- ALWAYS verify build succeeds before committing
-
-## Security Rules
-
-- NEVER hardcode API keys, secrets, or credentials in source files
-- NEVER commit .env files or any file containing secrets
-- Always validate user input at system boundaries
-- Always sanitize file paths to prevent directory traversal
-- Run `npx @claude-flow/cli@latest security scan` after security-related changes
-
-## Concurrency: 1 MESSAGE = ALL RELATED OPERATIONS
-
-- All operations MUST be concurrent/parallel in a single message
-- Use Claude Code's Task tool for spawning agents, not just MCP
-- ALWAYS batch ALL todos in ONE TodoWrite call (5-10+ minimum)
-- ALWAYS spawn ALL agents in ONE message with full instructions via Task tool
-- ALWAYS batch ALL file reads/writes/edits in ONE message
-- ALWAYS batch ALL Bash commands in ONE message
-
-## Swarm Orchestration
-
-- MUST initialize the swarm using CLI tools when starting complex tasks
-- MUST spawn concurrent agents using Claude Code's Task tool
-- Never use CLI tools alone for execution — Task tool agents do the actual work
-- MUST call CLI tools AND Task tool in ONE message for complex work
-
-### 3-Tier Model Routing (ADR-026)
-
-| Tier | Handler | Latency | Cost | Use Cases |
-|------|---------|---------|------|-----------|
-| **1** | Agent Booster (WASM) | <1ms | $0 | Simple transforms (var→const, add types) — Skip LLM |
-| **2** | Haiku | ~500ms | $0.0002 | Simple tasks, low complexity (<30%) |
-| **3** | Sonnet/Opus | 2-5s | $0.003-0.015 | Complex reasoning, architecture, security (>30%) |
-
-- Always check for `[AGENT_BOOSTER_AVAILABLE]` or `[TASK_MODEL_RECOMMENDATION]` before spawning agents
-- Use Edit tool directly when `[AGENT_BOOSTER_AVAILABLE]`
-
-## Swarm Configuration & Anti-Drift
-
-- ALWAYS use hierarchical topology for coding swarms
-- Keep maxAgents at 6-8 for tight coordination
-- Use specialized strategy for clear role boundaries
-- Use `raft` consensus for hive-mind (leader maintains authoritative state)
-- Run frequent checkpoints via `post-task` hooks
-- Keep shared memory namespace for all agents
+There are **no on-device unit tests**. Verification is done with host-side Python tools that speak the UDP protocol so you can exercise the firmware without the iOS app:
 
 ```bash
-npx @claude-flow/cli@latest swarm init --topology hierarchical --max-agents 8 --strategy specialized
+python tests/udp_test_sender.py      # sends synthetic JPEG frames to the ESP32 on :5000
+python tests/mjpeg_test_server.py    # serves an MJPEG-style stream
+python jpeg_receiver.py              # reference receiver (decodes the same protocol with OpenCV)
 ```
 
-## Swarm Execution Rules
+## Architecture
 
-- ALWAYS use `run_in_background: true` for all agent Task calls
-- ALWAYS put ALL agent Task calls in ONE message for parallel execution
-- After spawning, STOP — do NOT add more tool calls or check status
-- Never poll TaskOutput or check swarm status — trust agents to return
-- When agent results arrive, review ALL results before proceeding
+Entry point is `app_main()` in `main/example_qspi_with_ram.cpp` (~1000 lines, the bulk of the app). BLE provisioning is split into `main/ble_pairing.cpp`. All tunables live in `main/stream_config.h`.
 
-## V3 CLI Commands
+End-to-end flow:
 
-### Core Commands
+1. **BLE provisioning** (`ble_pairing.cpp`, NimBLE) — advertises as `ESP32-MapNav`, exposes a GATT service where iOS writes its IP, UDP port, and WiFi SSID/password. Credentials persist in NVS. Shared state (`g_ios_ip`, `g_stream_port`, `g_wifi_ssid/pass`) and an event group (`BLE_IP_RECEIVED_BIT`, `BLE_WIFI_CRED_RECEIVED_BIT`) are declared in `ble_pairing.h`.
+2. **WiFi STA** — `wifi_reconnect_task` waits for BLE creds (falling back to the hardcoded `WIFI_SSID`/`WIFI_PASS`), then `wifi_connect_to()`. Modem sleep is disabled (`WIFI_PS_NONE`) for low UDP latency.
+3. **Discovery** — `udp_hello_task` sends a "HELLO" datagram to the iOS IP on port **5001** every `UDP_HELLO_INTERVAL` ms so the sender learns the ESP32's address. BLE-supplied IP takes precedence over the `STREAM_SERVER_IP` fallback.
+4. **Frame reception** — `udp_receiver_task` binds port **5000** and runs a frame-assembly state machine: an SOI packet (`0xFF 0xD8`) starts a frame, raw JPEG chunks (≤1400 B) accumulate into a buffer, an EOI packet (`0xFF 0xD9`) closes it. Completed frames go onto `jpeg_frame_queue`.
+5. **Decode + display** — `jpeg_display_task` pulls frames, decodes with the BitBank `JPEGDEC` decoder (`RGB565_BIG_ENDIAN`, `JPEG_USES_DMA`), and `jpeg_decode_callback` draws each MCU block straight to the panel. `lcd_trans_done_callback` (ISR) signals DMA completion via a semaphore.
 
-| Command | Subcommands | Description |
-|---------|-------------|-------------|
-| `init` | 4 | Project initialization |
-| `agent` | 8 | Agent lifecycle management |
-| `swarm` | 6 | Multi-agent swarm coordination |
-| `memory` | 11 | AgentDB memory with HNSW search |
-| `task` | 6 | Task creation and lifecycle |
-| `session` | 7 | Session state management |
-| `hooks` | 17 | Self-learning hooks + 12 workers |
-| `hive-mind` | 6 | Byzantine fault-tolerant consensus |
+### Core isolation — the single most important constraint
 
-### Quick CLI Examples
+Read the comment block near the top of `example_qspi_with_ram.cpp` (CPU core assignments) before touching task creation or BLE.
 
-```bash
-npx @claude-flow/cli@latest init --wizard
-npx @claude-flow/cli@latest agent spawn -t coder --name my-coder
-npx @claude-flow/cli@latest swarm init --v3-mode
-npx @claude-flow/cli@latest memory search --query "authentication patterns"
-npx @claude-flow/cli@latest doctor --fix
-```
+- **Core 0**: NimBLE host (priority 21), WiFi/lwIP, `udp_hello_task`.
+- **Core 1**: `udp_receiver_task` (priority 6) and `jpeg_display_task` (priority 5), pinned via `xTaskCreatePinnedToCore`.
 
-## Available Agents (60+ Types)
+NimBLE runs at priority 21 and will preempt any Core-0 task for several ms. If the UDP receiver shares Core 0, those stalls overflow the lwIP UDP mailbox, EOI packets get dropped, and the assembly state machine restarts every frame → **zero frames decoded**. Keeping the receiver on Core 1 removes it from BLE scheduling entirely. The receiver also sits *above* the decoder in priority so it drains packets before decode work runs. `sdkconfig.defaults` raises `CONFIG_LWIP_UDP_RECVMBOX_SIZE` to 32 (~44 KB burst buffer) as further insurance.
 
-### Core Development
-`coder`, `reviewer`, `tester`, `planner`, `researcher`
+### LVGL is intentionally disabled
 
-### Specialized
-`security-architect`, `security-auditor`, `memory-specialist`, `performance-engineer`
+LVGL is still a dependency and the component is present, but all LVGL paths in `example_qspi_with_ram.cpp` are commented out — the JPEG decoder writes directly to the LCD for latency. Do not re-enable LVGL rendering for the stream path without understanding this trade-off.
 
-### Swarm Coordination
-`hierarchical-coordinator`, `mesh-coordinator`, `adaptive-coordinator`
+## Hardware / Config Facts
 
-### GitHub & Repository
-`pr-manager`, `code-review-swarm`, `issue-tracker`, `release-manager`
+- Target: ESP32-S3, 8 MB flash (QIO), SPIRAM in OCT mode @ 80 MHz, CPU @ 240 MHz. Custom `partitions.csv` (6 MB factory app, no OTA).
+- Panel: SH8601 **or** CO5300 over QSPI on `SPI2_HOST`, detected at runtime via `read_lcd_id_bsp` (`SH8601_ID 0x86` / `CO5300_ID 0xff`). LCD pins: CS 9, PCLK 10, D0–D3 11–14, RST 21. Touch (FT3168) via `touch_bsp` on I2C (SCL 48 / SDA 47).
+- Ports/sizes in `stream_config.h`: stream RX 5000, discovery TX 5001, max frame 128 KB, frame 466×466.
+- **WiFi creds and the dev fallback IP are hardcoded in `main/stream_config.h`** — they are real values committed to the repo, not placeholders. Treat changes to that file as touching secrets; BLE provisioning is meant to override them in production.
 
-### SPARC Methodology
-`sparc-coord`, `sparc-coder`, `specification`, `pseudocode`, `architecture`
+## Components
 
-## Memory Commands Reference
-
-```bash
-# Store (REQUIRED: --key, --value; OPTIONAL: --namespace, --ttl, --tags)
-npx @claude-flow/cli@latest memory store --key "pattern-auth" --value "JWT with refresh" --namespace patterns
-
-# Search (REQUIRED: --query; OPTIONAL: --namespace, --limit, --threshold)
-npx @claude-flow/cli@latest memory search --query "authentication patterns"
-
-# List (OPTIONAL: --namespace, --limit)
-npx @claude-flow/cli@latest memory list --namespace patterns --limit 10
-
-# Retrieve (REQUIRED: --key; OPTIONAL: --namespace)
-npx @claude-flow/cli@latest memory retrieve --key "pattern-auth" --namespace patterns
-```
-
-## Quick Setup
-
-```bash
-claude mcp add claude-flow -- npx -y @claude-flow/cli@latest
-npx @claude-flow/cli@latest daemon start
-npx @claude-flow/cli@latest doctor --fix
-```
-
-## Claude Code vs CLI Tools
-
-- Claude Code's Task tool handles ALL execution: agents, file ops, code generation, git
-- CLI tools handle coordination via Bash: swarm init, memory, hooks, routing
-- NEVER use CLI tools as a substitute for Task tool agents
-
-## Support
-
-- Documentation: https://github.com/ruvnet/claude-flow
-- Issues: https://github.com/ruvnet/claude-flow/issues
+Local components in `components/`: `jpegdec` (BitBank decoder with ESP32-S3 SIMD assembly — `s3_simd_*.S`), `touch_bsp`, `read_lcd_id_bsp`, `lvgl`, `ui_bsp`, `sd_card_bsp`, `user_app`. `esp_lcd_sh8601` and `espressif/esp-dsp` are pulled into `managed_components/` by the IDF component manager (declared in `main/idf_component.yml`). `main/CMakeLists.txt` lists the `REQUIRES` set and suppresses C++ designated-initializer warnings.

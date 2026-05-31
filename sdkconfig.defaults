@@ -16,6 +16,23 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_ESP_WIFI_GMAC_SUPPORT=n
 CONFIG_FREERTOS_HZ=1000
+
+# ── Bluetooth / NimBLE ────────────────────────────────────────────────────────
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# Pin BLE host to Core 0 (same as UDP I/O) so Core 1 stays free for JPEG decode
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# Disable unused security/pairing features to save RAM
+CONFIG_BT_NIMBLE_SM_LEGACY=n
+CONFIG_BT_NIMBLE_SM_SC=n
+
+# ── lwIP UDP tuning — reduce packet loss during BLE preemption ────────────────
+# Default UDP mailbox = 6 datagrams.  NimBLE host runs at priority 21 and can
+# preempt the UDP receiver (priority 4) for several ms during BLE events.
+# Increasing the mailbox to 32 entries gives ~44 KB of burst buffering
+# (32 × 1400 B), preventing EOI-packet drops that trigger frame overflow.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
 CONFIG_LWIP_TCP_WND_DEFAULT=5744
 CONFIG_LWIP_HOOK_IP6_INPUT_NONE=y

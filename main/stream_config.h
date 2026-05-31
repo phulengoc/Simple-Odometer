@@ -5,10 +5,15 @@
 #define WIFI_SSID           "Hazenut"
 #define WIFI_PASS           "19101998"
 
-// iOS host IP — used for HELLO discovery packets
-// L1 test : set to the computer IP running tests/udp_test_sender.py
-// L2 test : set to the iOS phone / simulator IP (visible in stream status)
-#define STREAM_SERVER_IP    "192.168.1.236"   // Mac running iOS Simulator (MapNavSwiftUI)
+// iOS host IP — FALLBACK used only when BLE pairing has not yet delivered an IP.
+// Once the MapNav iOS app connects over BLE and writes its IP, g_ios_ip in
+// ble_pairing.h takes precedence and this value is ignored.
+// Set to your Mac/iPhone IP for development without BLE (L1/L2 bench testing).
+#define STREAM_SERVER_IP    "192.168.1.236"
+
+// BLE peripheral device name — must be short enough to fit in a 31-byte ADV packet
+// alongside the Flags field (3 bytes) and name header (2 bytes): max 26 chars.
+#define BLE_DEVICE_NAME     "ESP32-MapNav"
 
 // UDP port configuration
 #define UDP_STREAM_PORT      5000   // ESP32 binds here; iOS/Python sends JPEG frames here

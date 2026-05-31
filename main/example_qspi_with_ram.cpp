@@ -32,12 +32,14 @@
 #include "nvs_flash.h"
 #include "lwip/err.h"
 #include "lwip/sockets.h"
+#include "ble_pairing.h"
 
 // #include "lvgl.h"
 #include "esp_lcd_sh8601.h"
 #include "touch_bsp.h"
 #include "read_lcd_id_bsp.h"
 #include "stream_config.h"
+#include "status_screen.h"
 #include "JPEGDEC.h"
 
 extern "C" {
@@ -55,11 +57,17 @@ static const char *TAG = "jpeg_stream_receiver";
 #define JPEG_EOI_MARKER    0xFFD9  // End of Image
 
 static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
+static int  s_retry_num    = 0;
+static bool s_wifi_started = false;   // true after esp_wifi_start()
 static const int MAXIMUM_RETRY = 5;
 
 // JPEG buffer and processing
 static QueueHandle_t jpeg_frame_queue;
+
+// Status/wait-screen info lines, filled once WiFi is up; reused by the display
+// task to repaint the wait screen if the stream stalls.
+static char s_status_ssid_line[40] = "";
+static char s_status_ip_line[24]   = "";
 
 typedef struct {
     uint8_t *data;
@@ -118,9 +126,24 @@ static uint8_t READ_LCD_ID = 0x00;
 // #define EXAMPLE_LVGL_TASK_STACK_SIZE   (4 * 1024)
 // #define EXAMPLE_LVGL_TASK_PRIORITY     2
 
-// CPU core assignments for dual-core optimization
-#define UDP_RECEIVER_CPU    0  // CPU 0 for network I/O
-#define JPEG_DECODER_CPU    1  // CPU 1 for JPEG decoding/LCD drawing
+// ── CPU core assignments ──────────────────────────────────────────────────────
+// Core 0: NimBLE host (priority 21) + Wi-Fi/lwIP + UDP HELLO sender
+// Core 1: UDP receiver + JPEG decoder / LCD draw
+//
+// The UDP receiver MUST run on Core 1.  NimBLE host runs at
+// configMAX_PRIORITIES-4 = priority 21 and can preempt any Core-0 task.
+// When it does, the lwIP UDP mailbox overflows and EOI framing packets are
+// dropped, causing the UDP frame-assembly state machine to restart on every
+// frame → 0 frames decoded.  Moving the receiver to Core 1 removes it from
+// BLE scheduling entirely.
+#define UDP_HELLO_CPU       0   // Core 0 — co-located with Wi-Fi/lwIP
+#define UDP_RECEIVER_CPU    1   // Core 1 — isolated from NimBLE
+#define JPEG_DECODER_CPU    1   // Core 1 — decode/display
+
+// Task priorities
+#define UDP_HELLO_PRIORITY    3
+#define UDP_RECEIVER_PRIORITY 6   // above JPEG decoder so packets drain before decoding
+#define JPEG_DECODER_PRIORITY 5
 
 // WiFi event handler
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -145,8 +168,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-// Initialize WiFi
-static void wifi_init_sta(void)
+// ── WiFi driver one-time initialisation ──────────────────────────────────────
+// Sets up the event group, netif, event handlers, and WiFi driver.
+// Does NOT connect — call wifi_connect_to() for that.
+static void wifi_driver_init(void)
 {
     s_wifi_event_group = xEventGroupCreate();
 
@@ -157,47 +182,80 @@ static void wifi_init_sta(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
+                                                        &event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+                                                        &event_handler, NULL, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // Disable modem sleep — keeps radio always-on for low-latency UDP.
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    ESP_LOGI(TAG, "WiFi driver initialised (not connected yet)");
+}
+
+// ── WiFi connect / reconnect ──────────────────────────────────────────────────
+// Sets credentials, starts (or restarts) the WiFi station, and blocks until
+// the connection is established or the maximum retries are exhausted.
+// Safe to call multiple times — used by the reconnect task when new BLE creds
+// arrive.
+static bool wifi_connect_to(const char *ssid, const char *pass)
+{
+    ESP_LOGI(TAG, "WiFi: connecting to SSID \"%s\" …", ssid);
 
     wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+    strncpy((char *)wifi_config.sta.ssid,     ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password,  pass, sizeof(wifi_config.sta.password) - 1);
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config.sta.pmf_cfg.capable    = true;
+    wifi_config.sta.pmf_cfg.required   = false;
+
+    // Reset retry counter and clear result bits before each attempt.
+    s_retry_num = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-    // Wait until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-    // number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above)
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-    // xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-    // happened.
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s", WIFI_SSID);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
+    if (!s_wifi_started) {
+        // First call — start the driver; WIFI_EVENT_STA_START fires event_handler
+        // which calls esp_wifi_connect().
+        ESP_ERROR_CHECK(esp_wifi_start());
+        s_wifi_started = true;
     } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        // Subsequent call — driver already running; just reconnect with new config.
+        // Disconnect triggers WIFI_EVENT_STA_DISCONNECTED → event_handler reconnects.
+        esp_wifi_disconnect();
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE, portMAX_DELAY);
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi: connected to \"%s\"", ssid);
+        return true;
+    }
+    ESP_LOGE(TAG, "WiFi: failed to connect to \"%s\"", ssid);
+    return false;
+}
+
+// ── WiFi reconnect task ───────────────────────────────────────────────────────
+// Waits for the BLE_WIFI_CRED_RECEIVED_BIT (set by wificred_chr_access when
+// iOS writes new hotspot credentials) and reconnects with the new SSID/pass.
+// Runs on Core 0 alongside the WiFi / NimBLE stack.
+static void wifi_reconnect_task(void *pvParameters)
+{
+    while (1) {
+        // pdTRUE: clear the bit after reading so subsequent writes re-trigger
+        EventBits_t bits = xEventGroupWaitBits(
+            g_ble_event_group, BLE_WIFI_CRED_RECEIVED_BIT,
+            pdTRUE, pdTRUE, portMAX_DELAY);
+
+        if (bits & BLE_WIFI_CRED_RECEIVED_BIT) {
+            ESP_LOGI(TAG, "WiFi reconnect triggered by BLE creds: ssid=%s", g_wifi_ssid);
+            wifi_connect_to(g_wifi_ssid, g_wifi_pass);
+        }
     }
 }
 
@@ -215,18 +273,55 @@ static void wifi_init_sta(void)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── UDP HELLO task ────────────────────────────────────────────────────────────
-// Sends "HELLO" to iOS/Python sender on UDP_DISCOVER_PORT so it learns our IP.
+// Sends "HELLO\0" to iOS on UDP_DISCOVER_PORT so the iOS UDPStreamSender
+// learns the ESP32 IP and starts sending JPEG frames.
+//
+// IP resolution order:
+//   1. Wait up to BLE_IP_WAIT_MS for iOS to deliver its IP over BLE.
+//   2. If BLE IP arrives   → use g_ios_ip (updated live on reconnect).
+//   3. If timeout elapses  → fall back to hardcoded STREAM_SERVER_IP.
+//
+#define BLE_IP_WAIT_MS  30000   // wait up to 30 s for BLE pairing before fallback
+
 static void udp_hello_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "UDP hello task: sending HELLO to %s:%d every %d ms",
-             STREAM_SERVER_IP, UDP_DISCOVER_PORT, UDP_HELLO_INTERVAL);
+    // ── Wait for BLE to deliver iOS IP (or fall back to hardcoded value) ──────
+    ESP_LOGI(TAG, "HELLO task: waiting up to %d ms for BLE IP…", BLE_IP_WAIT_MS);
+    EventBits_t bits = xEventGroupWaitBits(
+        g_ble_event_group, BLE_IP_RECEIVED_BIT,
+        pdFALSE,   // do NOT clear the bit — other tasks may also check it
+        pdTRUE,
+        pdMS_TO_TICKS(BLE_IP_WAIT_MS));
+
+    char target_ip[16];
+    if (bits & BLE_IP_RECEIVED_BIT) {
+        // Copy under mutex so we get a consistent string
+        strncpy(target_ip, g_ios_ip, 15);
+        target_ip[15] = '\0';
+        ESP_LOGI(TAG, "HELLO task: using BLE-provided IP %s", target_ip);
+    } else {
+        strncpy(target_ip, STREAM_SERVER_IP, 15);
+        target_ip[15] = '\0';
+        ESP_LOGW(TAG, "HELLO task: BLE timeout — falling back to %s", target_ip);
+    }
+
+    ESP_LOGI(TAG, "HELLO task: sending to %s:%d every %d ms",
+             target_ip, UDP_DISCOVER_PORT, UDP_HELLO_INTERVAL);
 
     struct sockaddr_in dest = {};
     dest.sin_family = AF_INET;
     dest.sin_port   = htons(UDP_DISCOVER_PORT);
-    inet_pton(AF_INET, STREAM_SERVER_IP, &dest.sin_addr);
+    inet_pton(AF_INET, target_ip, &dest.sin_addr);
 
     while (1) {
+        // If a new IP arrived over BLE since we started, switch to it.
+        if (g_ios_ip[0] != '\0' && strncmp(g_ios_ip, target_ip, 15) != 0) {
+            strncpy(target_ip, g_ios_ip, 15);
+            target_ip[15] = '\0';
+            inet_pton(AF_INET, target_ip, &dest.sin_addr);
+            ESP_LOGI(TAG, "HELLO task: IP updated to %s", target_ip);
+        }
+
         int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock < 0) {
             ESP_LOGE(TAG, "HELLO: socket() failed errno %d", errno);
@@ -236,13 +331,21 @@ static void udp_hello_task(void *pvParameters)
 
         const char *hello = "HELLO";
         while (1) {
+            // Live IP update check each iteration
+            if (g_ios_ip[0] != '\0' && strncmp(g_ios_ip, target_ip, 15) != 0) {
+                strncpy(target_ip, g_ios_ip, 15);
+                target_ip[15] = '\0';
+                inet_pton(AF_INET, target_ip, &dest.sin_addr);
+                ESP_LOGI(TAG, "HELLO task: IP updated to %s (live)", target_ip);
+            }
+
             int n = sendto(sock, hello, strlen(hello) + 1, 0,
                            (struct sockaddr *)&dest, sizeof(dest));
             if (n < 0) {
                 ESP_LOGE(TAG, "HELLO: sendto errno %d — recreating socket", errno);
                 break;
             }
-            ESP_LOGD(TAG, "HELLO sent to %s:%d", STREAM_SERVER_IP, UDP_DISCOVER_PORT);
+            ESP_LOGD(TAG, "HELLO → %s:%d", target_ip, UDP_DISCOVER_PORT);
             vTaskDelay(pdMS_TO_TICKS(UDP_HELLO_INTERVAL));
         }
 
@@ -270,7 +373,7 @@ static void udp_receiver_task(void *pvParameters)
     size_t    frame_used = 0;
     udp_rx_state_t state = UDP_STATE_WAITING_SOI;
     TickType_t last_data_tick = 0;
-    const TickType_t FRAME_TIMEOUT_TICKS = pdMS_TO_TICKS(3000);
+    const TickType_t FRAME_TIMEOUT_TICKS = pdMS_TO_TICKS(500);   // 500 ms — fast recovery on BLE preemption
 
     // Pre-allocate frame assembly buffer once (reused across frames)
     frame_buf = (uint8_t *)heap_caps_malloc(MAX_JPEG_FRAME_SIZE, MALLOC_CAP_SIMD);
@@ -291,6 +394,11 @@ static void udp_receiver_task(void *pvParameters)
 
         int reuse = 1;
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // Larger socket receive buffer: absorbs UDP bursts that arrive while the
+        // NimBLE host task (priority 21) preempts this task (priority 4) on Core 0.
+        int rcvbuf = 65536;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         // 1-second receive timeout so we can detect frame assembly timeouts
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
@@ -348,6 +456,18 @@ static void udp_receiver_task(void *pvParameters)
 
             case UDP_STATE_RECEIVING_DATA:
                 last_data_tick = xTaskGetTickCount();
+
+                // ── Guard: new SOI arrived before EOI ────────────────────────
+                // This happens when NimBLE (priority 21) preempts this task and
+                // the EOI framing packet is dropped from the lwIP mailbox.
+                // Without this check the assembly buffer accumulates data from
+                // multiple frames until it exceeds MAX_JPEG_FRAME_SIZE.
+                if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD8) {
+                    ESP_LOGW(TAG, "UDP rx: SOI mid-frame — dropped %zu B (BLE preemption?), restarting",
+                             frame_used);
+                    frame_used = 0;   // discard partial frame, stay in RECEIVING_DATA
+                    break;
+                }
 
                 if (n == 2 && pkt_buf[0] == 0xFF && pkt_buf[1] == 0xD9) {
                     // EOI framing packet: the DATA bytes already form a complete JPEG.
@@ -497,9 +617,24 @@ static void jpeg_display_task(void *pvParameters)
     }
     
     ESP_LOGI(TAG, "JPEG display task started - drawing directly to LCD");
-    
+
+    bool waiting_shown = false;   // true while the wait screen is displayed
+
     while (1) {
-        if (xQueueReceive(jpeg_frame_queue, &frame, portMAX_DELAY)) {
+        // Time-bounded wait so we can repaint the wait screen if the stream stalls.
+        if (!xQueueReceive(jpeg_frame_queue, &frame, pdMS_TO_TICKS(3000))) {
+            if (!waiting_shown) {
+                status_screen_show("ESP32 MapNav", "Waiting for stream",
+                                   s_status_ssid_line[0] ? s_status_ssid_line : NULL,
+                                   s_status_ip_line[0]   ? s_status_ip_line   : NULL);
+                waiting_shown = true;
+            }
+            continue;
+        }
+
+        {
+            // A frame arrived — it will overwrite the wait screen.
+            waiting_shown = false;
             ESP_LOGD(TAG, "Received JPEG frame: %d bytes", frame.size);
             frame_count++;
 
@@ -685,13 +820,18 @@ void test_jpeg_decoder()
 
 void app_main(void)
 {
-    // Initialize NVS
+    // Initialize NVS (required by both Wi-Fi and BLE)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // ── BLE pairing ───────────────────────────────────────────────────────────
+    // Start advertising so the iOS MapNav app can connect and write its IP/port.
+    // The udp_hello_task will block until BLE_IP_RECEIVED_BIT is set (or 30 s).
+    ble_pairing_init();
 
     // Create JPEG frame queue
     jpeg_frame_queue = xQueueCreate(2, sizeof(jpeg_frame_t));
@@ -768,6 +908,11 @@ void app_main(void)
     }
     xSemaphoreGive(lcd_trans_done_sem); // Initially available
     ESP_LOGI(TAG, "LCD DMA synchronization semaphore created");
+
+    // Bind the wait/status screen to the panel and show a boot message so the
+    // display is never blank while WiFi/BLE/streaming come up.
+    status_screen_init(panel_handle, lcd_trans_done_sem);
+    status_screen_show("ESP32 MapNav", "Starting up...", NULL, NULL);
     
     // Allocate double buffers for LCD drawing (DMA-capable memory)
     // lcd_draw_buffer[0] = (uint16_t*)heap_caps_malloc(LCD_DRAW_BUFFER_SIZE, MALLOC_CAP_SPIRAM|MALLOC_CAP_DMA);
@@ -877,21 +1022,83 @@ void app_main(void)
     }
     */
 
-    // Initialize WiFi
-    ESP_LOGI(TAG, "Starting WiFi initialization");
-    wifi_init_sta();
+    // ── WiFi initialisation ───────────────────────────────────────────────────
+    // One-time driver setup (no connection yet)
+    wifi_driver_init();
 
-    // Start UDP tasks on Core 0 (network I/O)
-    xTaskCreatePinnedToCore(udp_hello_task,    "udp_hello", 4096, NULL, 3, NULL, UDP_RECEIVER_CPU);
-    xTaskCreatePinnedToCore(udp_receiver_task, "udp_rx",    8192, NULL, 4, NULL, UDP_RECEIVER_CPU);
-    ESP_LOGI(TAG, "UDP hello+receiver tasks created on CPU %d", UDP_RECEIVER_CPU);
+    // ── Credential resolution ─────────────────────────────────────────────────
+    // Priority: NVS (previously provisioned) → BLE (iOS sends hotspot creds)
+    //           → hardcoded fallback in stream_config.h
+    char wifi_ssid[33] = {};
+    char wifi_pass[64] = {};
 
-    // Start JPEG display task on Core 1 (decode/display)
-    xTaskCreatePinnedToCore(jpeg_display_task, "jpeg_display", 8192, NULL, 5, NULL, JPEG_DECODER_CPU);
-    ESP_LOGI(TAG, "JPEG display task created on CPU %d", JPEG_DECODER_CPU);
+    if (ble_load_wifi_creds_from_nvs(wifi_ssid, wifi_pass)) {
+        ESP_LOGI(TAG, "Using NVS WiFi creds: ssid=%s", wifi_ssid);
+    } else {
+        ESP_LOGI(TAG, "No NVS creds — waiting up to 30 s for BLE provisioning …");
+        status_screen_show("ESP32 MapNav", "Pair phone via BLE",
+                           "to send Wi-Fi setup", NULL);
+        EventBits_t bits = xEventGroupWaitBits(
+            g_ble_event_group, BLE_WIFI_CRED_RECEIVED_BIT,
+            pdTRUE,   // clear bit — reconnect_task watches for future updates
+            pdTRUE,
+            pdMS_TO_TICKS(30000));
+
+        if (bits & BLE_WIFI_CRED_RECEIVED_BIT) {
+            strncpy(wifi_ssid, g_wifi_ssid, sizeof(wifi_ssid) - 1);
+            strncpy(wifi_pass, g_wifi_pass, sizeof(wifi_pass) - 1);
+            ESP_LOGI(TAG, "Using BLE-provisioned creds: ssid=%s", wifi_ssid);
+        } else {
+            strncpy(wifi_ssid, WIFI_SSID, sizeof(wifi_ssid) - 1);
+            strncpy(wifi_pass, WIFI_PASS,  sizeof(wifi_pass)  - 1);
+            ESP_LOGW(TAG, "BLE timeout — falling back to hardcoded SSID: %s", wifi_ssid);
+        }
+    }
+
+    status_screen_show("ESP32 MapNav", "Connecting Wi-Fi", wifi_ssid, NULL);
+
+    bool wifi_ok = wifi_connect_to(wifi_ssid, wifi_pass);
+
+    // Build the status info lines (SSID + assigned IP) used by the wait screen.
+    snprintf(s_status_ssid_line, sizeof(s_status_ssid_line), "Wi-Fi: %s", wifi_ssid);
+    if (wifi_ok) {
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip_info = {};
+        if (sta && esp_netif_get_ip_info(sta, &ip_info) == ESP_OK) {
+            snprintf(s_status_ip_line, sizeof(s_status_ip_line), "IP: " IPSTR,
+                     IP2STR(&ip_info.ip));
+        }
+        status_screen_show("ESP32 MapNav", "Waiting for stream",
+                           s_status_ssid_line, s_status_ip_line);
+    } else {
+        status_screen_show("ESP32 MapNav", "Wi-Fi failed",
+                           "check credentials", NULL);
+    }
+
+    // Core 0: HELLO sender lives with Wi-Fi / NimBLE (same RF subsystem)
+    xTaskCreatePinnedToCore(udp_hello_task,    "udp_hello",    4096, NULL,
+                            UDP_HELLO_PRIORITY,    NULL, UDP_HELLO_CPU);
+
+    // Core 1: receiver + decoder — completely isolated from NimBLE on Core 0
+    xTaskCreatePinnedToCore(udp_receiver_task, "udp_rx",       8192, NULL,
+                            UDP_RECEIVER_PRIORITY, NULL, UDP_RECEIVER_CPU);
+    xTaskCreatePinnedToCore(jpeg_display_task, "jpeg_display", 8192, NULL,
+                            JPEG_DECODER_PRIORITY, NULL, JPEG_DECODER_CPU);
+
+    // Core 0: monitors BLE_WIFI_CRED_RECEIVED_BIT and reconnects if iOS
+    // sends updated hotspot credentials after initial boot
+    xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_recon", 4096, NULL,
+                            3, NULL, UDP_HELLO_CPU);
+
+    ESP_LOGI(TAG, "Tasks: hello=CPU%d pri%d | rx=CPU%d pri%d | jpeg=CPU%d pri%d | recon=CPU%d",
+             UDP_HELLO_CPU,    UDP_HELLO_PRIORITY,
+             UDP_RECEIVER_CPU, UDP_RECEIVER_PRIORITY,
+             JPEG_DECODER_CPU, JPEG_DECODER_PRIORITY,
+             UDP_HELLO_CPU);
 
     ESP_LOGI(TAG, "JPEG Stream Receiver initialized — UDP mode");
-    ESP_LOGI(TAG, "Sending HELLO to %s:%d every %d ms",
+    ESP_LOGI(TAG, "WiFi: connected to \"%s\"", wifi_ssid);
+    ESP_LOGI(TAG, "Sending HELLO to <BLE-IP or %s>:%d every %d ms",
              STREAM_SERVER_IP, UDP_DISCOVER_PORT, UDP_HELLO_INTERVAL);
     ESP_LOGI(TAG, "Listening for JPEG frames on UDP port %d", UDP_STREAM_PORT);
 
