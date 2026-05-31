@@ -32,6 +32,31 @@ void status_screen_init(esp_lcd_panel_handle_t panel, SemaphoreHandle_t dma_done
 void status_screen_show(const char *line1, const char *line2,
                         const char *line3, const char *line4);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared text/blit primitives (used by status_screen_show and the nav HUD band).
+// The 8×8 bitmap font lives in status_screen.cpp; these expose it so other
+// direct-to-panel renderers can reuse it without duplicating the glyph table.
+// Same threading rule as the rest of the module: ONE task may draw at a time.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte-swap a native RGB565 colour to the panel's big-endian order.
+uint16_t status_be565(uint16_t color);
+
+/// Pixel width of `s` rendered at `scale` (8 px per glyph × scale).
+int status_text_width(const char *s, int scale);
+
+/// Draw left-aligned text into a caller-owned RGB565 `canvas` of size
+/// `canvas_w × canvas_h` (row stride = canvas_w) at top-left (x, y). `color_be`
+/// must already be byte-swapped (see status_be565). Pixels outside the canvas
+/// are clipped.
+void status_draw_text(uint16_t *canvas, int canvas_w, int canvas_h,
+                      int x, int y, const char *s, int scale, uint16_t color_be);
+
+/// Blit a CPU-rendered RGB565 canvas region (w × h, stride = w) to the panel at
+/// (dst_x, dst_y), strip-by-strip. Takes/restores the LCD DMA-done semaphore and
+/// blocks until the final transfer completes. Requires status_screen_init().
+void status_blit(const uint16_t *canvas, int w, int h, int dst_x, int dst_y);
+
 #ifdef __cplusplus
 }
 #endif

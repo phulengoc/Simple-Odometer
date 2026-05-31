@@ -40,6 +40,7 @@
 #include "read_lcd_id_bsp.h"
 #include "stream_config.h"
 #include "status_screen.h"
+#include "nav_hud.h"
 #include "JPEGDEC.h"
 
 extern "C" {
@@ -103,6 +104,12 @@ static int  s_draw_off_y = 0;
 // Clear the panel border around a centered image once before the next frame —
 // after boot and after every wait-screen repaint (both paint the full panel).
 static bool s_need_border_clear = true;
+// Last telemetry sequence painted into the HUD band (Phase-2 letterbox).
+// Sentinel forces a repaint on the next letterbox frame.
+static uint32_t s_band_last_seq = 0xFFFFFFFF;
+// Tracks the letterbox/fullscreen mode of the previous frame so a switch
+// triggers a one-time full clear (no stale band/border pixels left behind).
+static bool s_was_letterbox = false;
 
 // Display globals (LVGL disabled for performance)
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
@@ -384,6 +391,57 @@ static void udp_hello_task(void *pvParameters)
         }
 
         close(sock);
+    }
+
+    vTaskDelete(NULL);
+}
+
+// ── Nav telemetry task ────────────────────────────────────────────────────────
+// Receives turn-by-turn telemetry datagrams on NAV_TELEMETRY_PORT and updates
+// the shared HUD state. Low-rate (~2 Hz) and tiny, so it lives on Core 0
+// alongside the other RF/networking tasks. It NEVER touches the panel — the
+// display task is the sole drawer (see jpeg_display_task).
+static void nav_telemetry_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Nav telemetry task: listening on port %d", NAV_TELEMETRY_PORT);
+
+    static uint8_t rx_buf[600];   // header (24B) + two short strings
+
+    while (1) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "nav telemetry: socket() errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        struct sockaddr_in bind_addr = {};
+        bind_addr.sin_family      = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind_addr.sin_port        = htons(NAV_TELEMETRY_PORT);
+        if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            ESP_LOGE(TAG, "nav telemetry: bind() errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            continue;
+        }
+
+        while (1) {
+            int n = recvfrom(sock, rx_buf, sizeof(rx_buf), 0, NULL, NULL);
+            if (n < 0) {
+                ESP_LOGW(TAG, "nav telemetry: recvfrom errno %d — rebinding", errno);
+                break;
+            }
+            if (nav_hud_update(rx_buf, (size_t)n)) {
+                ESP_LOGD(TAG, "nav telemetry: updated (%d bytes)", n);
+            }
+        }
+
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
 
     vTaskDelete(NULL);
@@ -671,9 +729,19 @@ static void jpeg_display_task(void *pvParameters)
     bool waiting_shown = false;   // true while the wait screen is displayed
 
     while (1) {
-        // Time-bounded wait so we can repaint the wait screen if the stream stalls.
+        // Time-bounded wait so we can repaint the wait/HUD screen if the stream stalls.
         if (!xQueueReceive(s_ready_q, &frame, pdMS_TO_TICKS(3000))) {
-            if (!waiting_shown) {
+            // Phase 1: with no video frames, show the turn-by-turn HUD if we have
+            // fresh telemetry; otherwise fall back to the "waiting" screen.
+            // Repaint every tick (not just once) so distance/ETA update live.
+            if (nav_hud_is_fresh(NAV_HUD_FRESH_MS)) {
+                char l1[NAV_HUD_TEXT_MAX], l2[NAV_HUD_TEXT_MAX];
+                char l3[NAV_HUD_TEXT_MAX], l4[NAV_HUD_TEXT_MAX];
+                nav_hud_format_lines(l1, l2, l3, l4, NAV_HUD_TEXT_MAX);
+                status_screen_show(l1, l2, l3[0] ? l3 : NULL, l4);
+                waiting_shown = true;
+                s_need_border_clear = true;   // HUD painted full panel
+            } else if (!waiting_shown) {
                 status_screen_show("ESP32 MapNav", "Waiting for stream",
                                    s_status_ssid_line[0] ? s_status_ssid_line : NULL,
                                    s_status_ip_line[0]   ? s_status_ip_line   : NULL);
@@ -713,20 +781,53 @@ static void jpeg_display_task(void *pvParameters)
                 // Set pixel format to RGB565 for direct LCD output
                 jpeg_dec.setPixelType(RGB565_BIG_ENDIAN);
 
-                // Center the (possibly sub-panel) image; the decode callback adds
-                // this offset to every MCU block.
+                // Position the image; the decode callback adds this offset to
+                // every MCU block. Phase-2 letterbox: when fresh turn-by-turn
+                // telemetry is available, reserve the bottom NAV_HUD_BAND_HEIGHT
+                // rows for the native HUD band and seat the map in the region
+                // above it. Otherwise center the image on the full panel.
                 int iw = jpeg_dec.getWidth();
                 int ih = jpeg_dec.getHeight();
-                s_draw_off_x = (EXAMPLE_LCD_H_RES - iw) / 2;
-                s_draw_off_y = (EXAMPLE_LCD_V_RES - ih) / 2;
-                if (s_draw_off_x < 0) s_draw_off_x = 0;
-                if (s_draw_off_y < 0) s_draw_off_y = 0;
+                bool letterbox = nav_hud_is_fresh(NAV_HUD_FRESH_MS);
 
-                // Black out the panel once so no stale border surrounds a
-                // smaller-than-panel image (after boot / after a wait screen).
-                if (s_need_border_clear && (iw < EXAMPLE_LCD_H_RES || ih < EXAMPLE_LCD_V_RES)) {
+                // A mode switch leaves stale pixels (old band/border) — clear once.
+                if (letterbox != s_was_letterbox) {
+                    s_need_border_clear = true;
+                    s_was_letterbox = letterbox;
+                }
+
+                s_draw_off_x = (EXAMPLE_LCD_H_RES - iw) / 2;
+                if (s_draw_off_x < 0) s_draw_off_x = 0;
+                if (letterbox) {
+                    int region_h = EXAMPLE_LCD_V_RES - NAV_HUD_BAND_HEIGHT;  // top region
+                    s_draw_off_y = (region_h - ih) / 2;
+                    if (s_draw_off_y < 0) s_draw_off_y = 0;
+                } else {
+                    s_draw_off_y = (EXAMPLE_LCD_V_RES - ih) / 2;
+                    if (s_draw_off_y < 0) s_draw_off_y = 0;
+                }
+
+                // Black out the panel once so no stale pixels surround a
+                // smaller-than-panel image (after boot / wait screen / a switch
+                // into letterbox). Forces the band to repaint afterwards.
+                if (s_need_border_clear &&
+                    (iw < EXAMPLE_LCD_H_RES || ih < EXAMPLE_LCD_V_RES || letterbox)) {
                     status_screen_show(NULL, NULL, NULL, NULL);
                     s_need_border_clear = false;
+                    s_band_last_seq = 0xFFFFFFFF;
+                }
+
+                // Paint the HUD band above the map, but only when telemetry
+                // changed (the band region is disjoint from the map, so it
+                // persists between repaints).
+                if (letterbox) {
+                    uint32_t seq = nav_hud_seq();
+                    if (seq != s_band_last_seq) {
+                        nav_hud_draw_band();
+                        s_band_last_seq = seq;
+                    }
+                } else {
+                    s_band_last_seq = 0xFFFFFFFF;   // repaint when letterbox resumes
                 }
 
                 if (jpeg_dec.decode(0, 0, JPEG_USES_DMA)) {
@@ -1188,6 +1289,11 @@ void app_main(void)
     // Core 0: HELLO sender lives with Wi-Fi / NimBLE (same RF subsystem)
     xTaskCreatePinnedToCore(udp_hello_task,    "udp_hello",    4096, NULL,
                             UDP_HELLO_PRIORITY,    &s_hello_task_handle, UDP_HELLO_CPU);
+
+    // Core 0: turn-by-turn telemetry receiver — low-rate, networking-adjacent.
+    nav_hud_init();
+    xTaskCreatePinnedToCore(nav_telemetry_task, "nav_telem",   4096, NULL,
+                            UDP_HELLO_PRIORITY,    NULL, UDP_HELLO_CPU);
 
     // Core 1: receiver + decoder — completely isolated from NimBLE on Core 0
     xTaskCreatePinnedToCore(udp_receiver_task, "udp_rx",       8192, NULL,

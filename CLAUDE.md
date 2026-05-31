@@ -39,6 +39,7 @@ End-to-end flow:
 3. **Discovery** — `udp_hello_task` sends a "HELLO" datagram to the iOS IP on port **5001** every `UDP_HELLO_INTERVAL` ms so the sender learns the ESP32's address. BLE-supplied IP takes precedence over the `STREAM_SERVER_IP` fallback.
 4. **Frame reception** — `udp_receiver_task` binds port **5000** and runs a frame-assembly state machine: an SOI packet (`0xFF 0xD8`) starts a frame, raw JPEG chunks (≤1400 B) accumulate into a buffer, an EOI packet (`0xFF 0xD9`) closes it. Completed frames go onto `jpeg_frame_queue`.
 5. **Decode + display** — `jpeg_display_task` pulls frames, decodes with the BitBank `JPEGDEC` decoder (`RGB565_BIG_ENDIAN`, `JPEG_USES_DMA`), and `jpeg_decode_callback` draws each MCU block straight to the panel. `lcd_trans_done_callback` (ISR) signals DMA completion via a semaphore.
+6. **Turn-by-turn HUD** — `nav_telemetry_task` receives structured guidance on port **5002**; `nav_hud.{c,h}` formats it and `jpeg_display_task` composites a native HUD band on the bottom of the **round** panel (map letterboxed above). The font/blit primitives live in `status_screen.{c,h}`. Full design — round-screen safe area, layout, wire format: **`docs/NAV_HUD.md`**.
 
 ### Core isolation — the single most important constraint
 
@@ -57,7 +58,7 @@ LVGL is still a dependency and the component is present, but all LVGL paths in `
 
 - Target: ESP32-S3, 8 MB flash (QIO), SPIRAM in OCT mode @ 80 MHz, CPU @ 240 MHz. Custom `partitions.csv` (6 MB factory app, no OTA).
 - Panel: SH8601 **or** CO5300 over QSPI on `SPI2_HOST`, detected at runtime via `read_lcd_id_bsp` (`SH8601_ID 0x86` / `CO5300_ID 0xff`). LCD pins: CS 9, PCLK 10, D0–D3 11–14, RST 21. Touch (FT3168) via `touch_bsp` on I2C (SCL 48 / SDA 47).
-- Ports/sizes in `stream_config.h`: stream RX 5000, discovery TX 5001, max frame 128 KB, frame 466×466.
+- Ports/sizes in `stream_config.h`: stream RX 5000, discovery TX 5001, telemetry RX 5002, max frame 128 KB, panel 466×466 (round). Map region is 466×320 above a 146-px HUD band.
 - **WiFi creds and the dev fallback IP are hardcoded in `main/stream_config.h`** — they are real values committed to the repo, not placeholders. Treat changes to that file as touching secrets; BLE provisioning is meant to override them in production.
 
 ## Components

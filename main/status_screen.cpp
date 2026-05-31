@@ -131,8 +131,9 @@ static const uint8_t FONT8X8[95][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, // '~'
 };
 
-// Blit one scaled glyph into the RGB565 canvas at (x0, y0).
-static void draw_glyph(uint16_t *canvas, int x0, int y0, char ch, int scale, uint16_t color_be)
+// Blit one scaled glyph into a `canvas_w × canvas_h` RGB565 canvas at (x0, y0).
+static void draw_glyph(uint16_t *canvas, int canvas_w, int canvas_h,
+                       int x0, int y0, char ch, int scale, uint16_t color_be)
 {
     if (ch < 0x20 || ch > 0x7E) ch = ' ';
     const uint8_t *g = FONT8X8[ch - 0x20];
@@ -143,11 +144,11 @@ static void draw_glyph(uint16_t *canvas, int x0, int y0, char ch, int scale, uin
             if (!((bits >> col) & 0x01)) continue;
             for (int dy = 0; dy < scale; ++dy) {
                 int yy = y0 + row * scale + dy;
-                if (yy < 0 || yy >= SCR_H) continue;
-                uint16_t *line = canvas + (size_t)yy * SCR_W;
+                if (yy < 0 || yy >= canvas_h) continue;
+                uint16_t *line = canvas + (size_t)yy * canvas_w;
                 for (int dx = 0; dx < scale; ++dx) {
                     int xx = x0 + col * scale + dx;
-                    if (xx < 0 || xx >= SCR_W) continue;
+                    if (xx < 0 || xx >= canvas_w) continue;
                     line[xx] = color_be;
                 }
             }
@@ -162,8 +163,48 @@ static void draw_text_centered(uint16_t *canvas, const char *s, int y0, int scal
     int x0  = (SCR_W - w) / 2;
     if (x0 < 0) x0 = 0;   // left-align (and clip) if wider than the screen
     for (int i = 0; i < len; ++i) {
-        draw_glyph(canvas, x0 + i * GLYPH_W * scale, y0, s[i], scale, color_be);
+        draw_glyph(canvas, SCR_W, SCR_H, x0 + i * GLYPH_W * scale, y0, s[i], scale, color_be);
     }
+}
+
+// ── Shared primitives (declared in status_screen.h) ──────────────────────────
+
+uint16_t status_be565(uint16_t color) { return be565(color); }
+
+int status_text_width(const char *s, int scale) { return (int)strlen(s) * GLYPH_W * scale; }
+
+void status_draw_text(uint16_t *canvas, int canvas_w, int canvas_h,
+                      int x, int y, const char *s, int scale, uint16_t color_be)
+{
+    int len = (int)strlen(s);
+    for (int i = 0; i < len; ++i) {
+        draw_glyph(canvas, canvas_w, canvas_h, x + i * GLYPH_W * scale, y, s[i], scale, color_be);
+    }
+}
+
+void status_blit(const uint16_t *canvas, int w, int h, int dst_x, int dst_y)
+{
+    if (!s_panel) return;
+    uint16_t *strip = (uint16_t *)heap_caps_malloc((size_t)w * STRIP_H * 2, MALLOC_CAP_DMA);
+    if (!strip) {
+        ESP_LOGE(TAG, "blit strip alloc failed");
+        return;
+    }
+    // Take the DMA-done semaphore BEFORE refilling the shared strip so the
+    // previous transfer has finished reading it.
+    for (int sy = 0; sy < h; sy += STRIP_H) {
+        int rows = (sy + STRIP_H <= h) ? STRIP_H : (h - sy);
+        if (s_dma_sem) xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
+        memcpy(strip, canvas + (size_t)sy * w, (size_t)rows * w * 2);
+        esp_lcd_panel_draw_bitmap(s_panel, dst_x, dst_y + sy, dst_x + w, dst_y + sy + rows, strip);
+    }
+    // Wait for the final transfer before freeing `strip`, then restore the
+    // semaphore to "available" for the next drawer.
+    if (s_dma_sem) {
+        xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
+        xSemaphoreGive(s_dma_sem);
+    }
+    heap_caps_free(strip);
 }
 
 void status_screen_init(esp_lcd_panel_handle_t panel, SemaphoreHandle_t dma_done_sem)
@@ -181,12 +222,6 @@ void status_screen_show(const char *l1, const char *l2, const char *l3, const ch
     uint16_t *canvas = (uint16_t *)heap_caps_malloc((size_t)SCR_W * SCR_H * 2, MALLOC_CAP_SPIRAM);
     if (!canvas) {
         ESP_LOGE(TAG, "canvas alloc failed");
-        return;
-    }
-    uint16_t *strip = (uint16_t *)heap_caps_malloc((size_t)SCR_W * STRIP_H * 2, MALLOC_CAP_DMA);
-    if (!strip) {
-        ESP_LOGE(TAG, "strip alloc failed");
-        heap_caps_free(canvas);
         return;
     }
 
@@ -216,22 +251,8 @@ void status_screen_show(const char *l1, const char *l2, const char *l3, const ch
         y += GLYPH_H * scales[i] + LINE_GAP;
     }
 
-    // Blit strip-by-strip. Take the DMA-done semaphore BEFORE refilling the
-    // shared strip buffer so the previous transfer has finished reading it.
-    for (int sy = 0; sy < SCR_H; sy += STRIP_H) {
-        int h = (sy + STRIP_H <= SCR_H) ? STRIP_H : (SCR_H - sy);
-        if (s_dma_sem) xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
-        memcpy(strip, canvas + (size_t)sy * SCR_W, (size_t)h * SCR_W * 2);
-        esp_lcd_panel_draw_bitmap(s_panel, 0, sy, SCR_W, sy + h, strip);
-    }
+    // Blit the whole canvas (handles strip staging + DMA-done sync).
+    status_blit(canvas, SCR_W, SCR_H, 0, 0);
 
-    // Wait for the final transfer to complete before freeing `strip`, then
-    // restore the semaphore to "available" for the next drawer (JPEG path).
-    if (s_dma_sem) {
-        xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
-        xSemaphoreGive(s_dma_sem);
-    }
-
-    heap_caps_free(strip);
     heap_caps_free(canvas);
 }

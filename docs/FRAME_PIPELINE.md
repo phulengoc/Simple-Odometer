@@ -136,8 +136,10 @@ A borrowed buffer **must** be returned on *every* path that abandons a frame, or
 1. **Receive** a `frame_msg_t` from `s_ready_q` with a 3 s timeout. On timeout it repaints the wait/status screen (see [status_screen](../main/status_screen.cpp)) so the panel is never blank when the stream stalls.
 2. **Validate framing (P3):** before decoding, confirm the buffer starts `0xFFD8` and ends `0xFFD9`. This cheap check protects `JPEGDEC` from faulting on a corrupt/merged buffer that slipped through.
 3. **Decode:** `jpeg_dec.openRAM(pool[idx], size, jpeg_decode_callback)`, pixel type `RGB565_BIG_ENDIAN`, `decode(0,0, JPEG_USES_DMA)`.
-4. **Draw per MCU:** `jpeg_decode_callback` pushes each decoded MCU block straight to the panel via `esp_lcd_panel_draw_bitmap` — no framebuffer.
+4. **Draw per MCU:** `jpeg_decode_callback` pushes each decoded MCU block straight to the panel via `esp_lcd_panel_draw_bitmap` — no framebuffer. The draw offset (`s_draw_off_x/y`) centers the image, or seats it in the top region when the turn-by-turn HUD band is active (letterbox — see [`NAV_HUD.md`](NAV_HUD.md)).
 5. **Recycle:** push `idx` back to `s_free_q` (replaces the old `free()`).
+
+> When fresh telemetry is present, the display task also composites the native HUD band on the bottom cap of the round panel (repainted only on telemetry change). The band region is disjoint from the map region, so there is no per-MCU compositing conflict. See [`NAV_HUD.md`](NAV_HUD.md).
 
 ### DMA back-pressure
 

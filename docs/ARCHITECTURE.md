@@ -2,7 +2,7 @@
 
 High-level architecture of the **Stream_Recv** firmware: an ESP32-S3 application that receives a live JPEG video stream over WiFi/UDP from the MapNav iOS app and renders it on a 466×466 QSPI AMOLED panel.
 
-This document describes the *big picture* — components, data flow, the concurrency model, and the design constraints that shape the code. For BLE specifics see [`BLE_PAIRING.md`](BLE_PAIRING.md) and [`BLE_MANUAL_TEST_PLAN.md`](BLE_MANUAL_TEST_PLAN.md). For build/flash commands see [`../CLAUDE.md`](../CLAUDE.md).
+This document describes the *big picture* — components, data flow, the concurrency model, and the design constraints that shape the code. For BLE specifics see [`BLE_PAIRING.md`](BLE_PAIRING.md) and [`BLE_MANUAL_TEST_PLAN.md`](BLE_MANUAL_TEST_PLAN.md). For the turn-by-turn HUD, the round-screen layout, and the telemetry protocol see [`NAV_HUD.md`](NAV_HUD.md). For build/flash commands see [`../CLAUDE.md`](../CLAUDE.md).
 
 ---
 
@@ -43,7 +43,9 @@ Two transports work together:
 | Control plane | NimBLE GATT server | `main/ble_pairing.cpp` / `.h` | Receive IP/port/WiFi creds from iOS; persist to NVS |
 | Data plane (out) | `udp_hello_task` | `example_qspi_with_ram.cpp` | Beacon ESP32 presence to iOS on :5001 |
 | Data plane (in) | `udp_receiver_task` | `example_qspi_with_ram.cpp` | Reassemble JPEG frames from UDP packets on :5000 |
-| Decode + render | `jpeg_display_task` | `example_qspi_with_ram.cpp` | Decode JPEG → draw MCU blocks straight to panel |
+| Data plane (in) | `nav_telemetry_task` | `example_qspi_with_ram.cpp` | Receive turn-by-turn telemetry on :5002 → HUD state (see [`NAV_HUD.md`](NAV_HUD.md)) |
+| Decode + render | `jpeg_display_task` | `example_qspi_with_ram.cpp` | Decode JPEG → draw MCU blocks straight to panel; composite the HUD band |
+| HUD | `nav_hud.{c,h}` + `status_screen.{c,h}` | `main/` | Parse/format guidance; render the round-screen HUD (see [`NAV_HUD.md`](NAV_HUD.md)) |
 | Connectivity | `wifi_*` functions + `wifi_reconnect_task` | `example_qspi_with_ram.cpp` | WiFi STA lifecycle; reconnect on new BLE creds |
 | Decoder | BitBank `JPEGDEC` | `components/jpegdec/` | Baseline JPEG decode with ESP32-S3 SIMD assembly |
 | Display driver | `esp_lcd_sh8601` | `managed_components/` | QSPI panel I/O, DMA bitmap transfers |
@@ -178,6 +180,7 @@ hardcoded WIFI_SSID/WIFI_PASS in stream_config.h  (dev fallback)
 - **Pixel format** is fixed to `RGB565_BIG_ENDIAN` to match the panel's byte order (`CONFIG_LV_COLOR_16_SWAP`).
 - **Frame queue depth is 2.** If the decoder falls behind, `udp_receiver_task` drops the newest completed frame rather than blocking the network path — preferring freshness/latency over completeness.
 - **Double-buffer scaffolding exists but is disabled** (`lcd_draw_buffer[2]`, commented). The current path draws directly from the decoder's own MCU buffer.
+- **Round screen + HUD letterbox.** The panel is physically circular, and when turn-by-turn telemetry is fresh the map is seated in the top region with a native HUD band on the bottom cap. The display task computes the per-frame map offset and repaints the band only on telemetry change. The full design — round-screen safe area, layout, telemetry protocol — is in [`NAV_HUD.md`](NAV_HUD.md).
 
 ---
 
