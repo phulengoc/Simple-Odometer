@@ -1,4 +1,6 @@
 build
+.cache/
+.vscode/
 
 # Host-side font/preview tooling artifacts (see tools/)
 .fontvenv
