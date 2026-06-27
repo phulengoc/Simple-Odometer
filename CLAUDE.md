@@ -1,66 +1,61 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What This Is
 
-ESP32-S3 firmware that receives a JPEG video stream over WiFi/UDP from the MapNav iOS app and renders it on a 466×466 QSPI AMOLED panel. The on-device sender counterpart lives in the sibling `MapNavigationSwiftUI` / `maplibre-navigation-ios` projects in the parent workspace; this repo is the **receiver/display** end.
+A minimal ESP-IDF template for an ESP32-S3 driving a 466×466 round QSPI AMOLED
+panel (SH8601 or CO5300, auto-detected at runtime via `read_lcd_id_bsp`) with an
+FT3168 touch controller. It initializes the panel, draws text, and echoes touch
+coordinates — a clean base to build a display app on.
 
-Despite directory and target names inherited from the upstream Espressif `qspi_with_ram` LVGL example, this is now a bespoke streaming app. **`README.md` is the stale upstream example doc** (LVGL dashboard demo) — ignore it. `README_STREAM.md` is closer but predates full JPEG decode (it still says "Android" and "metadata only"); the source is the source of truth.
+Rendering is CPU-side into an RGB565 framebuffer, blitted straight to the panel
+(no LVGL). The font/blit primitives live in `main/status_screen.{cpp,h}`.
 
-## Build, Flash, Test
+## Build, Flash, Monitor
 
-This is an **ESP-IDF 5.3.2** project (CMake + `idf.py`), not an npm project. Always source the IDF toolchain first via the `get_idf` shell alias (it sources `$IDF_PATH/export.sh`); without it `idf.py` / `xtensa-esp32s3-elf-gcc` are not on `PATH`.
-
-```bash
-get_idf
-idf.py set-target esp32s3     # only needed on a fresh checkout
-idf.py build
-idf.py -p <PORT> flash monitor   # Ctrl-] to exit monitor
-idf.py menuconfig             # editing sdkconfig; defaults live in sdkconfig.defaults
-```
-
-There are **no on-device unit tests**. Verification is done with host-side Python tools that speak the UDP protocol so you can exercise the firmware without the iOS app:
+ESP-IDF project (CMake + `idf.py`). Source the toolchain first with the `get_idf`
+shell alias (activates ESP-IDF 5.5.2 here; sets `IDF_PATH`, the xtensa-esp-elf
+toolchain, and the Python venv). Shell state does not persist between commands,
+so chain it: `get_idf && idf.py build`.
 
 ```bash
-python tests/udp_test_sender.py      # sends synthetic JPEG frames to the ESP32 on :5000
-python tests/mjpeg_test_server.py    # serves an MJPEG-style stream
-python jpeg_receiver.py              # reference receiver (decodes the same protocol with OpenCV)
+get_idf && idf.py build
+get_idf && idf.py -p <PORT> flash monitor   # Ctrl-] to exit
+idf.py menuconfig             # defaults live in sdkconfig.defaults
 ```
+
+`set-target esp32s3` is not needed on a fresh checkout: there is no committed
+`sdkconfig` (it's regenerated), and the target is auto-detected as `esp32s3` from
+`sdkconfig.defaults`. The first build has the IDF component manager resolve
+`esp_lcd_sh8601` (+ `cmake_utilities`) and regenerate `dependencies.lock`.
+
+Verified building clean with ESP-IDF 5.5.2 (GCC 14.2.0). App image
+`build/amoled_display_template.bin` ≈ 262 KB, ~96% of the 6 MB app partition free.
 
 ## Architecture
 
-Entry point is `app_main()` in `main/example_qspi_with_ram.cpp` (~1000 lines, the bulk of the app). BLE provisioning is split into `main/ble_pairing.cpp`. All tunables live in `main/stream_config.h`.
-
-End-to-end flow:
-
-1. **BLE provisioning** (`ble_pairing.cpp`, NimBLE) — advertises as `ESP32-MapNav`, exposes a GATT service where iOS writes its IP, UDP port, and WiFi SSID/password. Credentials persist in NVS. Shared state (`g_ios_ip`, `g_stream_port`, `g_wifi_ssid/pass`) and an event group (`BLE_IP_RECEIVED_BIT`, `BLE_WIFI_CRED_RECEIVED_BIT`) are declared in `ble_pairing.h`.
-2. **WiFi STA** — `wifi_reconnect_task` waits for BLE creds (falling back to the hardcoded `WIFI_SSID`/`WIFI_PASS`), then `wifi_connect_to()`. Modem sleep is disabled (`WIFI_PS_NONE`) for low UDP latency.
-3. **Discovery** — `udp_hello_task` sends a "HELLO" datagram to the iOS IP on port **5001** every `UDP_HELLO_INTERVAL` ms so the sender learns the ESP32's address. BLE-supplied IP takes precedence over the `STREAM_SERVER_IP` fallback.
-4. **Frame reception** — `udp_receiver_task` binds port **5000** and runs a frame-assembly state machine: an SOI packet (`0xFF 0xD8`) starts a frame, raw JPEG chunks (≤1400 B) accumulate into a buffer, an EOI packet (`0xFF 0xD9`) closes it. Completed frames go onto `jpeg_frame_queue`.
-5. **Decode + display** — `jpeg_display_task` pulls frames, decodes with the BitBank `JPEGDEC` decoder (`RGB565_BIG_ENDIAN`, `JPEG_USES_DMA`), and `jpeg_decode_callback` draws each MCU block straight to the panel. `lcd_trans_done_callback` (ISR) signals DMA completion via a semaphore.
-6. **Turn-by-turn HUD** — `nav_telemetry_task` receives structured guidance on port **5002**; `nav_hud.{c,h}` formats it and `jpeg_display_task` composites a native HUD band on the bottom of the **round** panel (map letterboxed above). The font/blit primitives live in `status_screen.{c,h}`. Full design — round-screen safe area, layout, wire format: **`docs/NAV_HUD.md`**.
-
-### Core isolation — the single most important constraint
-
-Read the comment block near the top of `example_qspi_with_ram.cpp` (CPU core assignments) before touching task creation or BLE.
-
-- **Core 0**: NimBLE host (priority 21), WiFi/lwIP, `udp_hello_task`.
-- **Core 1**: `udp_receiver_task` (priority 6) and `jpeg_display_task` (priority 5), pinned via `xTaskCreatePinnedToCore`.
-
-NimBLE runs at priority 21 and will preempt any Core-0 task for several ms. If the UDP receiver shares Core 0, those stalls overflow the lwIP UDP mailbox, EOI packets get dropped, and the assembly state machine restarts every frame → **zero frames decoded**. Keeping the receiver on Core 1 removes it from BLE scheduling entirely. The receiver also sits *above* the decoder in priority so it drains packets before decode work runs. `sdkconfig.defaults` raises `CONFIG_LWIP_UDP_RECVMBOX_SIZE` to 32 (~44 KB burst buffer) as further insurance.
-
-### LVGL is intentionally disabled
-
-LVGL is still a dependency and the component is present, but all LVGL paths in `example_qspi_with_ram.cpp` are commented out — the JPEG decoder writes directly to the LCD for latency. Do not re-enable LVGL rendering for the stream path without understanding this trade-off.
+- `main/main.cpp` — `app_main()`: SPI/QSPI bus, panel IO, panel driver bring-up,
+  touch init, then a poll loop that redraws the touch coordinates on press. Pins
+  and panel init command sequences are at the top of this file.
+- `components/touch_bsp` — FT3168 touch over I2C (`Touch_Init`, `getTouch`).
+- `main/status_screen.{cpp,h}` — CPU text rendering with an 8×8 bitmap font and a
+  strip-by-strip DMA blit. NOT thread-safe: only one task may draw at a time. The
+  blit shares an LCD DMA-done semaphore that `lcd_trans_done_callback` (ISR in
+  main.cpp) gives on each completed transfer.
+- `components/read_lcd_id_bsp` — reads the panel controller ID for detection.
+- `esp_lcd_sh8601` (panel driver) + `cmake_utilities` are pulled into
+  `managed_components/` by the IDF component manager (see `main/idf_component.yml`).
 
 ## Hardware / Config Facts
 
-- Target: ESP32-S3, 8 MB flash (QIO), SPIRAM in OCT mode @ 80 MHz, CPU @ 240 MHz. Custom `partitions.csv` (6 MB factory app, no OTA).
-- Panel: SH8601 **or** CO5300 over QSPI on `SPI2_HOST`, detected at runtime via `read_lcd_id_bsp` (`SH8601_ID 0x86` / `CO5300_ID 0xff`). LCD pins: CS 9, PCLK 10, D0–D3 11–14, RST 21. Touch (FT3168) via `touch_bsp` on I2C (SCL 48 / SDA 47).
-- Ports/sizes in `stream_config.h`: stream RX 5000, discovery TX 5001, telemetry RX 5002, max frame 128 KB, panel 466×466 (round). Map region is 466×320 above a 146-px HUD band.
-- **WiFi creds and the dev fallback IP are hardcoded in `main/stream_config.h`** — they are real values committed to the repo, not placeholders. Treat changes to that file as touching secrets; BLE provisioning is meant to override them in production.
-
-## Components
-
-Local components in `components/`: `jpegdec` (BitBank decoder with ESP32-S3 SIMD assembly — `s3_simd_*.S`), `touch_bsp`, `read_lcd_id_bsp`, `lvgl`, `ui_bsp`, `sd_card_bsp`, `user_app`. `esp_lcd_sh8601` and `espressif/esp-dsp` are pulled into `managed_components/` by the IDF component manager (declared in `main/idf_component.yml`). `main/CMakeLists.txt` lists the `REQUIRES` set and suppresses C++ designated-initializer warnings.
+- ESP32-S3, 8 MB flash (QIO), Octal PSRAM @ 80 MHz, CPU @ 240 MHz. Custom
+  `partitions.csv` (6 MB factory app, no OTA).
+- Panel over QSPI on `SPI2_HOST`: CS 9, PCLK 10, D0–D3 11–14, RST 21. Panel is
+  466×466, RGB565, big-endian byte order (see `status_be565`).
+- The **CO5300** variant (LCD ID `0xff`) needs a 6-column X gap
+  (`esp_lcd_panel_set_gap(panel, 6, 0)`) or the image is shifted 6 px left; the
+  SH8601 (`0x86`) does not. See `docs/CO5300_PANEL_OFFSET.md`.
+- FT3168 touch over I2C: SCL 48, SDA 47.
+- The full-screen framebuffer (~434 KB) is allocated in PSRAM, so `CONFIG_SPIRAM`
+  must stay enabled.

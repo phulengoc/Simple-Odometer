@@ -10,7 +10,7 @@ static const char *TAG = "status_screen";
 // ── Panel geometry ────────────────────────────────────────────────────────────
 #define SCR_W   466
 #define SCR_H   466
-#define STRIP_H 16          // rows per DMA blit (internal-RAM staging buffer)
+#define STRIP_H 32          // rows per DMA blit (internal-RAM staging buffer)
 
 // ── Colours (native RGB565). Written byte-swapped to match the panel's
 //    big-endian byte order — the JPEG path uses RGB565_BIG_ENDIAN, so we must too.
@@ -182,29 +182,36 @@ void status_draw_text(uint16_t *canvas, int canvas_w, int canvas_h,
     }
 }
 
+// Two persistent internal-RAM staging strips, ping-ponged so the CPU can fill
+// the next strip while the previous one is still being DMA'd to the panel.
+static uint16_t *s_strip[2] = { NULL, NULL };
+
 void status_blit(const uint16_t *canvas, int w, int h, int dst_x, int dst_y)
 {
     if (!s_panel) return;
-    uint16_t *strip = (uint16_t *)heap_caps_malloc((size_t)w * STRIP_H * 2, MALLOC_CAP_DMA);
-    if (!strip) {
-        ESP_LOGE(TAG, "blit strip alloc failed");
-        return;
+    if (!s_strip[0]) {
+        s_strip[0] = (uint16_t *)heap_caps_malloc((size_t)w * STRIP_H * 2, MALLOC_CAP_DMA);
+        s_strip[1] = (uint16_t *)heap_caps_malloc((size_t)w * STRIP_H * 2, MALLOC_CAP_DMA);
+        if (!s_strip[0] || !s_strip[1]) { ESP_LOGE(TAG, "blit strip alloc failed"); return; }
     }
-    // Take the DMA-done semaphore BEFORE refilling the shared strip so the
-    // previous transfer has finished reading it.
+    // Clear any stale "available" token so each take below waits for a real
+    // transfer-done (the IO callback gives the semaphore once per transfer).
+    if (s_dma_sem) xSemaphoreTake(s_dma_sem, 0);
+
+    int buf = 0;
+    bool pending = false;
     for (int sy = 0; sy < h; sy += STRIP_H) {
         int rows = (sy + STRIP_H <= h) ? STRIP_H : (h - sy);
-        if (s_dma_sem) xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
-        memcpy(strip, canvas + (size_t)sy * w, (size_t)rows * w * 2);
-        esp_lcd_panel_draw_bitmap(s_panel, dst_x, dst_y + sy, dst_x + w, dst_y + sy + rows, strip);
+        uint16_t *sb = s_strip[buf];
+        // Fill this strip while the previous strip's DMA is still in flight.
+        memcpy(sb, canvas + (size_t)sy * w, (size_t)rows * w * 2);
+        if (pending && s_dma_sem) xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
+        esp_lcd_panel_draw_bitmap(s_panel, dst_x, dst_y + sy, dst_x + w, dst_y + sy + rows, sb);
+        pending = true;
+        buf ^= 1;
     }
-    // Wait for the final transfer before freeing `strip`, then restore the
-    // semaphore to "available" for the next drawer.
-    if (s_dma_sem) {
-        xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
-        xSemaphoreGive(s_dma_sem);
-    }
-    heap_caps_free(strip);
+    if (pending && s_dma_sem) xSemaphoreTake(s_dma_sem, pdMS_TO_TICKS(200));
+    if (s_dma_sem) xSemaphoreGive(s_dma_sem);   // leave "available" for next caller
 }
 
 void status_screen_init(esp_lcd_panel_handle_t panel, SemaphoreHandle_t dma_done_sem)

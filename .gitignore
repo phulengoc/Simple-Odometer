@@ -1,1 +1,11 @@
 build
+
+# Host-side font/preview tooling artifacts (see tools/)
+.fontvenv
+tools/host_preview
+tools/*.ppm
+tools/preview*.png
+tools/digits_preview.png
+tools/p3_*.png
+tools/p4_*.png
+tools/JetBrainsMono-digits.ttf
