@@ -1,53 +1,135 @@
-# ESP32-S3 QSPI AMOLED — Display Template
+# Simple-Odometer
 
-A minimal ESP-IDF starting point for the 466×466 round AMOLED panel (SH8601 or
-CO5300, auto-detected at runtime) driven over QSPI, with the FT3168 touch
-controller. It brings the panel up, draws a few lines of text, and shows the
-touch coordinates when you press the screen. Use it as the base for your own UI.
+Simple-Odometer is an ESP-IDF firmware project for an ESP32-S3 driving a
+466x466 round QSPI AMOLED display. It renders a custom tachometer/speedometer UI
+with a rolling mechanical-style odometer, gear indicator, and RPM-driven outer
+arc directly into RGB565 framebuffers, without LVGL.
 
-Rendering is done on the CPU into an RGB565 framebuffer and blitted straight to
-the panel (no LVGL), using a small built-in 8×8 bitmap font.
+The current application is a self-running demo: speed sweeps through simulated
+gear bands, RPM eases through each shift, and the odometer rolls continuously so
+the display behavior can be inspected on real hardware.
 
-## Layout
+## Hardware Preview
 
-```
-main/
-  main.cpp            app_main(): panel bring-up, demo text, touch poll loop
-  status_screen.cpp   CPU text rendering + DMA blit to the panel (8×8 font)
-  status_screen.h
-components/
-  read_lcd_id_bsp/    reads the panel controller ID for SH8601/CO5300 detection
-  touch_bsp/          FT3168 touch controller over I2C (Touch_Init / getTouch)
-managed_components/   esp_lcd_sh8601 panel driver (+ cmake_utilities), via IDF
-                      component manager
-partitions.csv        8 MB flash, single 6 MB factory app (no OTA)
-sdkconfig.defaults    target/flash/PSRAM/clock defaults
-```
+Real hardware photos:
+
+<TBD>
+
+Close-up of the round AMOLED tachometer UI:
+
+<TBD>
+
+Odometer reel / gear indicator detail:
+
+<TBD>
+
+## Features
+
+- 466x466 round AMOLED UI rendered CPU-side into RGB565 buffers.
+- 270-degree RPM arc with anti-aliased tick marks.
+- Large center speed readout in km/h.
+- Gear indicator with neutral state.
+- Rolling odometer reels with fractional movement and drum shading.
+- SH8601 / CO5300 panel controller auto-detection.
+- CO5300 horizontal offset compensation.
+- FT3168 touch controller initialization over I2C.
+- Host preview tooling for rendering the gauge frame without flashing hardware.
 
 ## Hardware
 
-- ESP32-S3, 8 MB flash (QIO), Octal PSRAM @ 80 MHz, CPU @ 240 MHz.
-- Panel over QSPI on `SPI2_HOST`: CS 9, PCLK 10, D0–D3 11–14, RST 21.
-- FT3168 touch over I2C: SCL 48, SDA 47 (see `components/touch_bsp`).
+- ESP32-S3 with 8 MB flash and octal PSRAM.
+- 466x466 round AMOLED panel over QSPI.
+- Supported panel controllers: SH8601 and CO5300.
+- FT3168 touch controller over I2C.
 
-Pins and the panel init sequences live at the top of `main/main.cpp`.
+Panel pins:
 
-## Build, flash, monitor
+| Signal | GPIO |
+| --- | ---: |
+| LCD CS | 9 |
+| LCD PCLK | 10 |
+| LCD D0 | 11 |
+| LCD D1 | 12 |
+| LCD D2 | 13 |
+| LCD D3 | 14 |
+| LCD RST | 21 |
+| Touch SDA | 47 |
+| Touch SCL | 48 |
 
-This is an ESP-IDF project. Source the toolchain first (`. $IDF_PATH/export.sh`),
-then:
+## Project Layout
 
-```bash
-idf.py set-target esp32s3     # first checkout only
-idf.py build
-idf.py -p <PORT> flash monitor   # Ctrl-] to exit the monitor
+```text
+main/
+  main.cpp            Panel bring-up, demo state simulation, render loop
+  tach_ring.cpp       Tachometer / odometer UI renderer
+  tach_ring.h         Renderer API and tach state
+  status_screen.cpp   Startup text screen and shared DMA strip blit path
+  digits_font.h       Generated anti-aliased digit coverage glyphs
+  text8x8.c/.h        Small bitmap text font support
+
+components/
+  read_lcd_id_bsp/    Panel controller ID detection
+  touch_bsp/          FT3168 touch initialization and read helpers
+
+tools/
+  host_preview.cpp    Desktop preview harness for the tach renderer
+  preview.sh          Builds the host preview and emits a PNG
+  gen_digits.py       Regenerates the committed digit font header
+
+docs/
+  CO5300_PANEL_OFFSET.md
 ```
 
-The first build downloads `esp_lcd_sh8601` into `managed_components/`.
+## Build, Flash, Monitor
 
-## Drawing your own content
+This is an ESP-IDF project. Source your ESP-IDF environment first, then build:
 
-Replace the `status_screen_show(...)` call at the end of `app_main()`. For custom
-graphics, render RGB565 into a buffer and call `status_blit()`, or draw directly
-with `esp_lcd_panel_draw_bitmap(g_panel_handle, ...)`. Note RGB565 must be
-written big-endian for this panel — see `status_be565()`.
+```bash
+idf.py build
+```
+
+Flash and monitor:
+
+```bash
+idf.py -p <PORT> flash monitor
+```
+
+If your local setup uses the `get_idf` helper, chain it with the build command:
+
+```bash
+get_idf && idf.py build
+```
+
+## Host Preview
+
+The tach renderer can be compiled on the host to generate a preview image:
+
+```bash
+tools/preview.sh
+```
+
+Optional arguments:
+
+```bash
+tools/preview.sh <speed> <gear> <odo> <rpm> <out.png>
+```
+
+Example:
+
+```bash
+tools/preview.sh 72 4 4905.8 6500 tools/preview.png
+```
+
+The preview path is useful for layout iteration, but the physical display path
+still matters because the panel uses big-endian RGB565 transfers and the CO5300
+variant needs a 6-pixel X gap.
+
+## Notes
+
+- Rendering is intentionally direct: no LVGL, no scene graph, no GPU pipeline.
+- Full-frame buffers live in PSRAM; DMA transfers use internal RAM staging
+  strips.
+- The CO5300 panel variant is shifted horizontally unless
+  `esp_lcd_panel_set_gap(panel, 6, 0)` is applied after panel init.
+- `main/digits_font.h` is generated and committed so normal firmware builds do
+  not need Python font tooling.
