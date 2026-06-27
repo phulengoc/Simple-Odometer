@@ -37,6 +37,7 @@ Odometer reel / gear indicator detail:
 
 ## Hardware
 
+- Tested dev board: [Waveshare ESP32-S3-Touch-AMOLED-1.43C](https://www.waveshare.com/esp32-s3-touch-amoled-1.43c.htm?srsltid=AfmBOoroXqveHNwoGJR4NJwJvz6fQ2-zKf6xAC5W_67eQjcCgJj34KcY).
 - ESP32-S3 with 8 MB flash and octal PSRAM.
 - 466x466 round AMOLED panel over QSPI.
 - Supported panel controllers: SH8601 and CO5300.
