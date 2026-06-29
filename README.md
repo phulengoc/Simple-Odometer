@@ -11,11 +11,9 @@ the display behavior can be inspected on real hardware.
 
 ## Hardware Preview
 
-Real hardware photos:
+Demo video:
 
-
-
-Uploading IMG_5600.mp4…
+https://github.com/user-attachments/assets/4b2edb5b-7c81-431b-88ba-a9dd24611091
 
 
 Close-up of the round AMOLED tachometer UI:
