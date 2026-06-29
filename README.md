@@ -13,7 +13,10 @@ the display behavior can be inspected on real hardware.
 
 Real hardware photos:
 
-<TBD>
+
+
+Uploading IMG_5600.mp4…
+
 
 Close-up of the round AMOLED tachometer UI:
 
